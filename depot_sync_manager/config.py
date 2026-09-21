@@ -39,6 +39,7 @@ APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE   = APPDATA_DIR / "config.json"
 MANIFEST_FILE = APPDATA_DIR / "manifest.json"
 LOG_FILE      = APPDATA_DIR / "uploader.log"
+DB_FILE       = APPDATA_DIR / "uploder.db"   # локальный операторский индекс релизов/чанков, см. db.py
 
 DEFAULT_EXCLUDES = [
     ".git", ".svn", ".hg", ".vs", ".idea", "__pycache__",

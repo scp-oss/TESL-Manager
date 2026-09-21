@@ -49,6 +49,13 @@
 current/versions и chunk-формат channels/build_id — см.
 `resolve_version_path()`), но раз ключ уже известен из живого сервера
 (`v1_20eb01df`), надёжнее передать его явно.
+
+ЛОКАЛЬНЫЙ ИНДЕКС (SQLite, `db.py`): по умолчанию каждый успешный запуск
+(и `--dry-run`, и реальное восстановление) заносит разобранный манифест
+версии (файлы/чанки) и итоги запуска в локальную БД оператора
+(`%APPDATA%\\Uploder\\uploder.db`, см. `db.py`'s собственный докстринг —
+это ТОЛЬКО локальный индекс для запросов, не публикуется на WebDAV и не
+читается TESL). Отключить — `--no-db`; свой путь к файлу БД — `--db-path`.
 """
 
 import argparse
@@ -64,6 +71,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.auth import HTTPBasicAuth
+
+# db.py лежит рядом в этой же папке (depot_sync_manager/) — добавляем её в
+# sys.path явно, чтобы скрипт можно было запускать и как файл напрямую
+# (`python recover_from_chunks.py`), не только как часть пакета.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db as _db  # noqa: E402 (см. комментарий выше про sys.path)
 
 CHUNK_DIR    = "chunks"
 VERSIONS_DIR = "versions"
@@ -240,20 +253,20 @@ class ChunkRecoverer:
 
     def fetch_version_manifest(
         self, version_key: Optional[str]
-    ) -> Tuple[Optional[str], Optional[List[FileEntry]]]:
+    ) -> Tuple[Optional[str], Optional[List[FileEntry]], Optional[dict]]:
         path = self.resolve_version_path(version_key)
         if path is None:
-            return None, None
+            return None, None, None
         self.on_log(f"📥 Загружаем {path} ...")
         data = self.fetch_json(path)
         if data is None:
-            return None, None
+            return None, None, None
         try:
             entries = parse_version_manifest(data)
         except ValueError as e:
             self.on_log(f"❌ {e}")
-            return None, None
-        return path, entries
+            return None, None, None
+        return path, entries, data
 
     # ── Hashing ───────────────────────────────────────────────────────────────
 
@@ -365,12 +378,16 @@ class ChunkRecoverer:
 
     # ── Recover ───────────────────────────────────────────────────────────────
 
-    def recover(self, entries: List[FileEntry], resume: bool = True) -> bool:
+    def recover(self, entries: List[FileEntry], resume: bool = True) -> dict:
         """
         Скачивает все чанки, собирает файлы, верифицирует sha256 целиком.
         resume=True — пропускает файлы, уже существующие локально с верным
         размером И хэшем (можно безопасно прерывать Ctrl+C и перезапускать
         тем же способом — единственная копия этих данных, лучше перебдеть).
+
+        Возвращает словарь статистики (files_total/files_ok/files_failed/
+        files_skipped/chunks_total/chunks_missing/ok) — используется и для
+        exit-кода CLI, и для записи в локальный индекс (`db.py`).
         """
         to_process: List[FileEntry] = []
         for e in entries:
@@ -386,7 +403,11 @@ class ChunkRecoverer:
 
         if not to_process:
             self.on_log("✅ Восстанавливать нечего — все файлы уже на месте и верны")
-            return True
+            return {
+                "ok": True, "files_total": len(entries), "files_ok": 0,
+                "files_failed": 0, "files_skipped": skipped,
+                "chunks_total": 0, "chunks_missing": 0,
+            }
 
         needed_chunks: Set[str] = set()
         chunk_to_files: Dict[str, List[FileEntry]] = {}
@@ -464,7 +485,11 @@ class ChunkRecoverer:
                 "или ошибка верификации) — перезапуск с --resume (по умолчанию) "
                 "докачает только их после устранения причины."
             )
-        return fail == 0
+        return {
+            "ok": fail == 0, "files_total": len(entries), "files_ok": ok,
+            "files_failed": fail, "files_skipped": skipped,
+            "chunks_total": len(needed_chunks), "chunks_missing": len(failed_chunks),
+        }
 
     def close(self):
         self.session.close()
@@ -519,6 +544,15 @@ def main():
     )
     parser.add_argument("--workers", type=int, default=8, help="Потоков параллельной загрузки чанков")
     parser.add_argument("--no-ssl-verify", action="store_true", help="Отключить проверку TLS-сертификата")
+    parser.add_argument(
+        "--no-db", action="store_true",
+        help="Не писать в локальный индекс (db.py, %%APPDATA%%/Uploder/uploder.db). "
+             "По умолчанию манифест версии и итоги запуска заносятся туда автоматически.",
+    )
+    parser.add_argument(
+        "--db-path", default=None,
+        help="Свой путь к файлу SQLite вместо %%APPDATA%%/Uploder/uploder.db.",
+    )
     args = parser.parse_args()
 
     password = _resolve_password(args.password)
@@ -533,23 +567,63 @@ def main():
         max_workers=args.workers,
     )
 
+    conn = None
+    if not args.no_db:
+        try:
+            conn = _db.init_db(args.db_path)
+        except Exception as e:
+            print(f"⚠️ Не удалось открыть локальный индекс ({e}) — продолжаем без него.")
+            conn = None
+
     try:
-        version_path, entries = recoverer.fetch_version_manifest(args.version_key)
+        version_path, entries, raw_manifest = recoverer.fetch_version_manifest(args.version_key)
         if entries is None:
             print("❌ Не удалось загрузить/разобрать манифест версии — см. лог выше.")
             sys.exit(1)
 
         print(f"📋 Манифест версии: {version_path}")
 
+        version_key = args.version_key or (
+            Path(version_path).stem if version_path else None
+        )
+
+        if conn is not None and version_key:
+            protocol = "hybrid" if any(e.component for e in entries) else "chunk"
+            _db.sync_release(
+                conn, version_key=version_key, protocol=protocol, entries=entries,
+                raw_manifest=raw_manifest, remote_path=args.remote_path,
+            )
+            print(f"🗄 Манифест версии занесён в локальный индекс ({len(entries)} файлов).")
+
+        mode = "dry-run" if args.dry_run else "recover"
+        run_id = _db.start_recovery_run(conn, version_key, args.remote_path, mode) if conn is not None else None
+
         if args.dry_run:
-            recoverer.dry_run(entries, check_server=not args.no_check_server)
+            report = recoverer.dry_run(entries, check_server=not args.no_check_server)
             print("\nℹ️ Это был --dry-run — ничего не скачано и не записано на диск.")
+            if conn is not None and run_id is not None:
+                _db.finish_recovery_run(conn, run_id, _db.RecoveryRunResult(
+                    version_key=version_key, remote_path=args.remote_path, mode=mode,
+                    files_total=report["files"], chunks_total=report["unique_chunks"],
+                    chunks_missing=len(report["missing_chunks"]),
+                    notes="dry-run, ничего не скачивалось",
+                ))
             sys.exit(0)
 
-        ok = recoverer.recover(entries, resume=not args.no_resume)
-        sys.exit(0 if ok else 1)
+        stats = recoverer.recover(entries, resume=not args.no_resume)
+        if conn is not None and run_id is not None:
+            _db.finish_recovery_run(conn, run_id, _db.RecoveryRunResult(
+                version_key=version_key, remote_path=args.remote_path, mode=mode,
+                files_total=stats["files_total"], files_ok=stats["files_ok"],
+                files_failed=stats["files_failed"], files_skipped=stats["files_skipped"],
+                chunks_total=stats["chunks_total"], chunks_missing=stats["chunks_missing"],
+                out_dir=args.out_dir,
+            ))
+        sys.exit(0 if stats["ok"] else 1)
     finally:
         recoverer.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":
