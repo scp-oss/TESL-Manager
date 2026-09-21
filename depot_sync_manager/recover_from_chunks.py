@@ -45,10 +45,15 @@
     python recover_from_chunks.py ... --version-key v1_20eb01df
 
 --version-key можно не указывать — тогда скрипт попробует определить
-версию сам из depot.json (оба возможных формата depot.json — компонентный
-current/versions и chunk-формат channels/build_id — см.
-`resolve_version_path()`), но раз ключ уже известен из живого сервера
-(`v1_20eb01df`), надёжнее передать его явно.
+версию сам из depot.json. РЕАЛЬНАЯ схема depot.json (подтверждено на живом
+сервере 2026-09-21) — `{"versions": {key: {...,"manifest": "versions/key.json"}},
+"current": {channel: key} | {}}`; если `current` пуст (версия ещё не
+активирована ни на одном канале — ровно так на сервере прямо сейчас) и
+`versions` содержит ровно одну запись, эта версия берётся автоматически.
+Два более старых варианта схемы depot.json (компонентный `current`-only,
+chunk-формат `channels`) оставлены как запасные варианты на случай другой
+сборки — см. `resolve_version()`. Раз ключ уже известен
+(`v1_20eb01df`), надёжнее передать его явно через `--version-key`.
 
 ЛОКАЛЬНЫЙ ИНДЕКС (SQLite, `db.py`): по умолчанию каждый успешный запуск
 (и `--dry-run`, и реальное восстановление) заносит разобранный манифест
@@ -218,23 +223,61 @@ class ChunkRecoverer:
 
     # ── Version resolution ───────────────────────────────────────────────────
 
-    def resolve_version_path(self, version_key: Optional[str]) -> Optional[str]:
+    def resolve_version(self, version_key: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
+        """
+        Возвращает (путь_к_манифесту, resolved_version_key, version_meta).
+        `version_meta` — запись из depot.json для этой версии (если найдена
+        оттуда), с полями вроде `build_number`/`build_id`/`channel`/
+        `file_count`/`total_size`/`chunk_count`/`components` — None, если
+        версия задана явным `--version-key` и depot.json не запрашивался.
+        """
         if version_key:
-            return f"{VERSIONS_DIR}/{version_key}.json"
+            return f"{VERSIONS_DIR}/{version_key}.json", version_key, None
 
         self.on_log("📥 --version-key не задан, пробуем определить из depot.json...")
         depot = self.fetch_json(DEPOT_META)
         if depot is None:
-            return None
+            return None, None, None
 
-        # Компонентный формат depot.json: {"current": {channel: version_key}}
+        # РЕАЛЬНАЯ схема, подтверждена на живом сервере 2026-09-21:
+        # {"versions": {key: {..., "manifest": "versions/key.json", "components": {...}}},
+        #  "current": {channel: key} | {}}
+        versions = depot.get("versions")
+        if isinstance(versions, dict) and versions:
+            current = depot.get("current") or {}
+            key = None
+            if isinstance(current, dict) and current:
+                key = next(iter(current.values()))
+            elif len(versions) == 1:
+                key = next(iter(versions.keys()))
+                self.on_log(
+                    f"⚠️ 'current' в depot.json пуст (версия ещё не активирована ни на одном "
+                    f"канале) — берём единственную версию из 'versions': {key}"
+                )
+            else:
+                self.on_log(
+                    f"❌ 'current' в depot.json пуст, а версий несколько "
+                    f"({list(versions.keys())}) — укажи --version-key явно"
+                )
+                return None, None, None
+
+            meta = versions.get(key)
+            if meta is None:
+                self.on_log(f"❌ 'current'/единственная версия указывает на {key}, которой нет в 'versions'")
+                return None, None, None
+            manifest_rel = meta.get("manifest") or f"{VERSIONS_DIR}/{key}.json"
+            self.on_log(f"📄 depot.json ('versions'-формат): версия {key} -> {manifest_rel}")
+            return manifest_rel, key, meta
+
+        # Компонентный формат (более старая гипотеза, оставлена на случай
+        # другой сборки): {"current": {channel: version_key}}
         current = depot.get("current")
         if isinstance(current, dict) and current:
             key = next(iter(current.values()))
             self.on_log(f"📄 depot.json (компонентный формат): версия {key}")
-            return f"{VERSIONS_DIR}/{key}.json"
+            return f"{VERSIONS_DIR}/{key}.json", key, None
 
-        # Chunk-формат depot.json: {"channels": {channel: {build_number, build_id}}}
+        # Chunk-формат (тоже гипотеза): {"channels": {channel: {build_number, build_id}}}
         channels = depot.get("channels")
         if isinstance(channels, dict) and channels:
             ch = next(iter(channels.values()))
@@ -243,30 +286,33 @@ class ChunkRecoverer:
             if build_id and build_number:
                 key = f"v{build_number}_{build_id}"
                 self.on_log(f"📄 depot.json (chunk-формат): версия {key}")
-                return f"{VERSIONS_DIR}/{key}.json"
+                return f"{VERSIONS_DIR}/{key}.json", key, None
             if build_id:
                 self.on_log(f"📄 depot.json (chunk-формат, без build_number): версия {build_id}")
-                return f"{VERSIONS_DIR}/{build_id}.json"
+                return f"{VERSIONS_DIR}/{build_id}.json", build_id, None
 
         self.on_log("❌ Не удалось определить версию из depot.json — укажи --version-key явно")
-        return None
+        return None, None, None
 
     def fetch_version_manifest(
         self, version_key: Optional[str]
-    ) -> Tuple[Optional[str], Optional[List[FileEntry]], Optional[dict]]:
-        path = self.resolve_version_path(version_key)
+    ) -> Tuple[Optional[str], Optional[str], Optional[List[FileEntry]], Optional[dict], Optional[dict]]:
+        """
+        Возвращает (путь, resolved_version_key, entries, raw_version_json, depot_version_meta).
+        """
+        path, resolved_key, depot_meta = self.resolve_version(version_key)
         if path is None:
-            return None, None, None
+            return None, None, None, None, None
         self.on_log(f"📥 Загружаем {path} ...")
         data = self.fetch_json(path)
         if data is None:
-            return None, None, None
+            return None, resolved_key, None, None, depot_meta
         try:
             entries = parse_version_manifest(data)
         except ValueError as e:
             self.on_log(f"❌ {e}")
-            return None, None, None
-        return path, entries, data
+            return None, resolved_key, None, None, depot_meta
+        return path, resolved_key, entries, data, depot_meta
 
     # ── Hashing ───────────────────────────────────────────────────────────────
 
@@ -576,22 +622,23 @@ def main():
             conn = None
 
     try:
-        version_path, entries, raw_manifest = recoverer.fetch_version_manifest(args.version_key)
+        version_path, version_key, entries, raw_manifest, depot_meta = recoverer.fetch_version_manifest(args.version_key)
         if entries is None:
             print("❌ Не удалось загрузить/разобрать манифест версии — см. лог выше.")
             sys.exit(1)
 
         print(f"📋 Манифест версии: {version_path}")
 
-        version_key = args.version_key or (
-            Path(version_path).stem if version_path else None
-        )
-
         if conn is not None and version_key:
             protocol = "hybrid" if any(e.component for e in entries) else "chunk"
+            depot_meta = depot_meta or {}
             _db.sync_release(
                 conn, version_key=version_key, protocol=protocol, entries=entries,
                 raw_manifest=raw_manifest, remote_path=args.remote_path,
+                build_number=depot_meta.get("build_number"),
+                build_id=depot_meta.get("build_id"),
+                channel=depot_meta.get("channel"),
+                declared_chunk_count=depot_meta.get("chunk_count"),
             )
             print(f"🗄 Манифест версии занесён в локальный индекс ({len(entries)} файлов).")
 

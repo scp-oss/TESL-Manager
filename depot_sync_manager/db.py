@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS releases (
     remote_path   TEXT,
     file_count    INTEGER,
     total_size    INTEGER,
+    chunk_count   INTEGER,                     -- заявленное depot.json число уникальных чанков (может отсутствовать до полного sync)
+    files_synced  INTEGER NOT NULL DEFAULT 0,  -- 1 = files/chunks реально занесены (полный sync версии-манифеста), 0 = известны только агрегаты из depot.json
     raw_json      TEXT,                        -- сырой манифест как пришёл — для отладки/аудита
     first_synced_at TEXT NOT NULL,
     last_synced_at  TEXT NOT NULL
@@ -111,8 +113,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    Идемпотентные ALTER TABLE для колонок, добавленных ПОСЛЕ первого релиза
+    db.py — `CREATE TABLE IF NOT EXISTS` не добавляет новые колонки в уже
+    существующую таблицу сам по себе, поэтому это нужно отдельно, иначе у
+    операторов с уже созданной (более старой) `uploder.db` новые колонки
+    просто не появятся.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(releases)")}
+    if "chunk_count" not in cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN chunk_count INTEGER")
+    if "files_synced" not in cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN files_synced INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
 def init_db(path: Union[str, Path, None] = None) -> sqlite3.Connection:
-    """Открывает (создавая при необходимости) БД и применяет схему."""
+    """Открывает (создавая при необходимости) БД, применяет схему и миграции."""
     if path is None:
         from config import DB_FILE
         path = DB_FILE
@@ -123,6 +141,7 @@ def init_db(path: Union[str, Path, None] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate(conn)
     return conn
 
 
@@ -132,88 +151,137 @@ def sync_release(
     conn: sqlite3.Connection,
     version_key: str,
     protocol: str,
-    entries: List,          # List[FileEntry] — см. recover_from_chunks.py::FileEntry
+    entries: Optional[List] = None,   # List[FileEntry] — см. recover_from_chunks.py::FileEntry
     raw_manifest: Optional[dict] = None,
     build_number: Optional[int] = None,
     build_id: Optional[str] = None,
     channel: Optional[str] = None,
     remote_path: Optional[str] = None,
+    declared_file_count: Optional[int] = None,
+    declared_total_size: Optional[int] = None,
+    declared_chunk_count: Optional[int] = None,
+    components_meta: Optional[Dict[str, bool]] = None,  # {name: included} — когда entries нет
 ) -> None:
     """
-    Заносит/обновляет одну версию и все её файлы/чанки. Идемпотентно —
-    повторный вызов с теми же данными просто перезаписывает файлы/чанки этой
-    версии (DELETE + INSERT), чтобы не плодить дубликаты при повторных `sync`.
+    Заносит/обновляет одну версию. Идемпотентно — повторный вызов с теми же
+    данными просто перезаписывает файлы/чанки этой версии (DELETE + INSERT),
+    чтобы не плодить дубликаты при повторных `sync`.
+
+    Два режима:
+      - `entries` задан (полный манифест версии уже разобран парсером) —
+        заносятся ПОЛНЫЕ files/chunks/components, `files_synced=1`. Обычный
+        путь при работе с `versions/<key>.json` (recover_from_chunks.py,
+        ingest_local.py с обоими файлами на диске).
+      - `entries=None` — только агрегатные метаданные версии (например, из
+        одного depot.json — `declared_file_count`/`declared_total_size`/
+        `declared_chunk_count`/`components_meta`, БЕЗ похода за большим
+        файлом версии). `files_synced` остаётся как было (0, если версии
+        раньше вообще не было) — таблицы files/chunks НЕ трогаются, чтобы
+        не затереть уже занесённые ранее полным sync'ом данные метаданными
+        без них. Полезно, когда файл версии слишком большой, чтобы обработать
+        прямо сейчас, но depot.json уже есть — заносим что знаем, полный
+        sync можно сделать позже без потери этой промежуточной записи.
     """
     now = _now()
-    total_size = sum(e.size for e in entries)
-
-    by_component: Dict[str, List] = {}
-    for e in entries:
-        by_component.setdefault(e.component or "", []).append(e)
 
     with conn:
         existing = conn.execute(
-            "SELECT first_synced_at FROM releases WHERE version_key = ?", (version_key,)
+            "SELECT first_synced_at, files_synced FROM releases WHERE version_key = ?", (version_key,)
         ).fetchone()
         first_synced_at = existing["first_synced_at"] if existing else now
+
+        if entries is not None:
+            file_count = len(entries)
+            total_size = sum(e.size for e in entries)
+            chunk_count = declared_chunk_count
+            files_synced = 1
+        else:
+            file_count = declared_file_count
+            total_size = declared_total_size
+            chunk_count = declared_chunk_count
+            # Если полный sync уже был раньше — не понижаем файловый флаг
+            # обратно только потому, что в этот раз пришли одни метаданные.
+            files_synced = 1 if (existing and existing["files_synced"]) else 0
 
         conn.execute(
             """
             INSERT INTO releases
                 (version_key, protocol, build_number, build_id, channel, remote_path,
-                 file_count, total_size, raw_json, first_synced_at, last_synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 file_count, total_size, chunk_count, files_synced, raw_json,
+                 first_synced_at, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(version_key) DO UPDATE SET
                 protocol = excluded.protocol,
-                build_number = excluded.build_number,
-                build_id = excluded.build_id,
-                channel = excluded.channel,
-                remote_path = excluded.remote_path,
+                build_number = COALESCE(excluded.build_number, releases.build_number),
+                build_id = COALESCE(excluded.build_id, releases.build_id),
+                channel = COALESCE(excluded.channel, releases.channel),
+                remote_path = COALESCE(excluded.remote_path, releases.remote_path),
                 file_count = excluded.file_count,
                 total_size = excluded.total_size,
-                raw_json = excluded.raw_json,
+                chunk_count = COALESCE(excluded.chunk_count, releases.chunk_count),
+                files_synced = excluded.files_synced,
+                raw_json = COALESCE(excluded.raw_json, releases.raw_json),
                 last_synced_at = excluded.last_synced_at
             """,
             (
                 version_key, protocol, build_number, build_id, channel, remote_path,
-                len(entries), total_size,
+                file_count, total_size, chunk_count, files_synced,
                 json.dumps(raw_manifest, ensure_ascii=False) if raw_manifest is not None else None,
                 first_synced_at, now,
             ),
         )
 
-        conn.execute("DELETE FROM components WHERE version_key = ?", (version_key,))
-        for comp_name, comp_entries in by_component.items():
-            if not comp_name:
-                continue
-            conn.execute(
-                """
-                INSERT INTO components (version_key, name, included, file_count, total_size)
-                VALUES (?, ?, 1, ?, ?)
-                """,
-                (version_key, comp_name, len(comp_entries), sum(e.size for e in comp_entries)),
-            )
+        if entries is not None:
+            by_component: Dict[str, List] = {}
+            for e in entries:
+                by_component.setdefault(e.component or "", []).append(e)
 
-        conn.execute("DELETE FROM files WHERE version_key = ?", (version_key,))
-        conn.execute("DELETE FROM chunks WHERE version_key = ?", (version_key,))
-        for e in entries:
-            conn.execute(
-                """
-                INSERT INTO files (version_key, component, path, size, file_hash, chunk_count)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (version_key, e.component or "", e.path, e.size, e.file_hash, len(e.chunks)),
-            )
-            if e.chunks:
-                conn.executemany(
+            conn.execute("DELETE FROM components WHERE version_key = ?", (version_key,))
+            for comp_name, comp_entries in by_component.items():
+                if not comp_name:
+                    continue
+                conn.execute(
                     """
-                    INSERT INTO chunks (version_key, component, path, chunk_id, offset, size)
+                    INSERT INTO components (version_key, name, included, file_count, total_size)
+                    VALUES (?, ?, 1, ?, ?)
+                    """,
+                    (version_key, comp_name, len(comp_entries), sum(e.size for e in comp_entries)),
+                )
+
+            conn.execute("DELETE FROM files WHERE version_key = ?", (version_key,))
+            conn.execute("DELETE FROM chunks WHERE version_key = ?", (version_key,))
+            for e in entries:
+                conn.execute(
+                    """
+                    INSERT INTO files (version_key, component, path, size, file_hash, chunk_count)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    [
-                        (version_key, e.component or "", e.path, c.chunk_id, c.offset, c.size)
-                        for c in e.chunks
-                    ],
+                    (version_key, e.component or "", e.path, e.size, e.file_hash, len(e.chunks)),
+                )
+                if e.chunks:
+                    conn.executemany(
+                        """
+                        INSERT INTO chunks (version_key, component, path, chunk_id, offset, size)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (version_key, e.component or "", e.path, c.chunk_id, c.offset, c.size)
+                            for c in e.chunks
+                        ],
+                    )
+        elif components_meta:
+            # Метаданные-only режим: знаем только include-флаги компонентов
+            # (из depot.json), file_count/total_size на уровне компонента
+            # неизвестны без большого файла версии — оставляем NULL, не 0
+            # (0 значило бы "компонент пустой", а мы просто не знаем).
+            conn.execute("DELETE FROM components WHERE version_key = ?", (version_key,))
+            for comp_name, included in components_meta.items():
+                conn.execute(
+                    """
+                    INSERT INTO components (version_key, name, included, file_count, total_size)
+                    VALUES (?, ?, ?, NULL, NULL)
+                    """,
+                    (version_key, comp_name, 1 if included else 0),
                 )
 
 
