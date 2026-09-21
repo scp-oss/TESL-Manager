@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+.vscode/
+.idea/
+*.log
+recovered_build/
