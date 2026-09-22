@@ -12,10 +12,14 @@
 #      проверит и откажется работать, если включено — см. ниже, почему).
 #   2. Получи Origin-сертификат Cloudflare (SSL/TLS -> Origin Server ->
 #      Create Certificate в дэшборде Cloudflare, 15 лет, бесплатно) и
-#      положи его ДО запуска в:
-#        /etc/ssl/tesl-depot/origin.pem   (сертификат)
-#        /etc/ssl/tesl-depot/origin.key   (приватный ключ)
-#      (пути можно переопределить флагами --cert/--key)
+#      положи его ДО запуска в (прямой запрос пользователя — всё, что
+#      относится к этому сервису, лежит в ОДНОМ месте, не разбросано по
+#      /etc; единственное исключение — симлинк в /etc/nginx/sites-enabled/,
+#      сам nginx конфиги берёт только оттуда, это неизбежный минимум):
+#        /opt/tesl-depot/ssl/origin.pem   (сертификат)
+#        /opt/tesl-depot/ssl/origin.key   (приватный ключ)
+#      (весь каталог проекта можно переопределить флагом --project-dir,
+#      конкретно пути сертификата/ключа — --cert/--key)
 #   3. В Cloudflare: A/AAAA-запись на этот сервер, статус "Proxied"
 #      (оранжевое облако), SSL/TLS mode = "Full (strict)".
 #   4. В Cloudflare: Cache Rule для этого хоста — иначе Cloudflare по
@@ -37,23 +41,32 @@ NC_USER=""
 DEPOT_SUBPATH=""
 NC_WEB_USER="www-data"
 OCC_PATH=""
-CERT_PATH="/etc/ssl/tesl-depot/origin.pem"
-KEY_PATH="/etc/ssl/tesl-depot/origin.key"
-HTPASSWD_PATH="/etc/nginx/tesl-depot.htpasswd"
+PROJECT_DIR="/opt/tesl-depot"
+CERT_PATH=""       # по умолчанию вычисляется из PROJECT_DIR ниже, после парсинга аргументов
+KEY_PATH=""
+HTPASSWD_PATH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --domain)        DOMAIN="$2"; shift 2 ;;
+        --domain)         DOMAIN="$2"; shift 2 ;;
         --nc-user)        NC_USER="$2"; shift 2 ;;
         --depot-subpath)  DEPOT_SUBPATH="$2"; shift 2 ;;
         --nc-web-user)    NC_WEB_USER="$2"; shift 2 ;;
         --occ)            OCC_PATH="$2"; shift 2 ;;
+        --project-dir)    PROJECT_DIR="$2"; shift 2 ;;
         --cert)           CERT_PATH="$2"; shift 2 ;;
         --key)            KEY_PATH="$2"; shift 2 ;;
         --htpasswd)       HTPASSWD_PATH="$2"; shift 2 ;;
         *) echo "Неизвестный аргумент: $1" >&2; exit 1 ;;
     esac
 done
+
+# Дефолты, зависящие от PROJECT_DIR — считаются ПОСЛЕ парсинга аргументов
+# (чтобы --project-dir мог их переопределить одним флагом), но только если
+# --cert/--key/--htpasswd не заданы явно по отдельности.
+: "${CERT_PATH:=$PROJECT_DIR/ssl/origin.pem}"
+: "${KEY_PATH:=$PROJECT_DIR/ssl/origin.key}"
+: "${HTPASSWD_PATH:=$PROJECT_DIR/tesl-depot.htpasswd}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "Нужен root (sudo)." >&2
@@ -64,7 +77,12 @@ if [[ -z "$DOMAIN" || -z "$NC_USER" || -z "$DEPOT_SUBPATH" ]]; then
     exit 1
 fi
 
-echo "== 1/7: Ищем occ (консоль Nextcloud) =="
+echo "== 1/8: Каталог проекта =="
+mkdir -p "$PROJECT_DIR/ssl" "$PROJECT_DIR/nginx"
+chmod 700 "$PROJECT_DIR/ssl"   # приватный ключ внутри — root-only, ровно как раньше был /etc/ssl/tesl-depot
+echo "   $PROJECT_DIR"
+
+echo "== 2/8: Ищем occ (консоль Nextcloud) =="
 if [[ -z "$OCC_PATH" ]]; then
     for candidate in /var/www/nextcloud/occ /var/www/html/nextcloud/occ /var/www/html/occ; do
         if [[ -f "$candidate" ]]; then
@@ -84,7 +102,7 @@ run_occ() {
     sudo -u "$NC_WEB_USER" php "$OCC_PATH" "$@"
 }
 
-echo "== 2/7: Проверяем encryption (КРИТИЧНО — если включено, файлы на диске зашифрованы, читать их в обход Nextcloud нельзя) =="
+echo "== 3/8: Проверяем encryption (КРИТИЧНО — если включено, файлы на диске зашифрованы, читать их в обход Nextcloud нельзя) =="
 ENC_STATUS="$(run_occ encryption:status 2>&1 || true)"
 if echo "$ENC_STATUS" | grep -qi "enabled: true\|Encryption is enabled"; then
     echo "❌ Server-side encryption ВКЛЮЧЕНО в Nextcloud." >&2
@@ -95,7 +113,7 @@ if echo "$ENC_STATUS" | grep -qi "enabled: true\|Encryption is enabled"; then
 fi
 echo "   ✅ Encryption выключено (или occ не смог явно подтвердить, что включено — вывод: $ENC_STATUS)"
 
-echo "== 3/7: Определяем datadirectory =="
+echo "== 4/8: Определяем datadirectory =="
 DATADIR="$(run_occ config:system:get datadirectory)"
 if [[ -z "$DATADIR" || ! -d "$DATADIR" ]]; then
     echo "❌ Не удалось получить datadirectory через occ (получили: '$DATADIR')" >&2
@@ -104,7 +122,7 @@ fi
 echo "   datadirectory: $DATADIR"
 
 ALIAS_PATH="$DATADIR/$NC_USER/files/$DEPOT_SUBPATH"
-echo "== 4/7: Проверяем итоговый путь =="
+echo "== 5/8: Проверяем итоговый путь =="
 echo "   $ALIAS_PATH"
 if [[ ! -d "$ALIAS_PATH" ]]; then
     echo "❌ Директория не существует. Проверь --nc-user/--depot-subpath." >&2
@@ -123,7 +141,7 @@ if ! find "$ALIAS_PATH" -maxdepth 2 -type d -name chunks | grep -q .; then
 fi
 echo "   ✅ Нашли минимум одну сборку с chunks/"
 
-echo "== 5/7: Устанавливаем nginx (если ещё нет) =="
+echo "== 6/8: Устанавливаем nginx (если ещё нет) =="
 if ! command -v nginx >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y nginx apache2-utils
@@ -131,7 +149,7 @@ else
     command -v htpasswd >/dev/null 2>&1 || apt-get install -y apache2-utils
 fi
 
-echo "== 6/7: Basic Auth =="
+echo "== 7/8: Basic Auth =="
 if [[ -f "$HTPASSWD_PATH" ]]; then
     echo "   $HTPASSWD_PATH уже существует, не трогаю (удали вручную, если нужно пересоздать)."
 else
@@ -146,13 +164,18 @@ if [[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]]; then
     echo "   либо доразверни вручную (см. докстринг файла для инструкции)."
 fi
 
-echo "== 7/7: Конфиг nginx =="
+echo "== 8/8: Конфиг nginx =="
 TEMPLATE="$(dirname "$0")/nginx-depot-read.conf.template"
 if [[ ! -f "$TEMPLATE" ]]; then
     echo "❌ Не найден $TEMPLATE рядом со скриптом." >&2
     exit 1
 fi
-CONF_PATH="/etc/nginx/sites-available/${DOMAIN}.conf"
+# Реальный файл — внутри PROJECT_DIR (прямой запрос пользователя, всё
+# относящееся к этому сервису в одном месте). В /etc/nginx/sites-enabled/
+# кладём ТОЛЬКО симлинк — сам nginx (через стандартный
+# `include /etc/nginx/sites-enabled/*;` в nginx.conf на Debian) конфиги
+# ищет исключительно там, это неизбежный минимум взаимодействия с /etc.
+CONF_PATH="$PROJECT_DIR/nginx/${DOMAIN}.conf"
 sed \
     -e "s#__DOMAIN__#${DOMAIN}#g" \
     -e "s#__ALIAS_PATH__#${ALIAS_PATH}#g" \
@@ -166,7 +189,7 @@ if nginx -t; then
     systemctl reload nginx
     echo "✅ nginx настроен и перезагружен."
 else
-    echo "❌ nginx -t провалился — см. вывод выше (частая причина — отсутствующий сертификат, см. шаг 6)." >&2
+    echo "❌ nginx -t провалился — см. вывод выше (частая причина — отсутствующий сертификат, см. шаг 7)." >&2
     exit 1
 fi
 
