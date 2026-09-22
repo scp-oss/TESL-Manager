@@ -27,9 +27,19 @@
 #      Authorization (Basic Auth), а нам нужно кэшировать /chunks/ —
 #      см. вывод скрипта в конце, там точная инструкция.
 #
-# Использование:
+# Использование (datadirectory — обычный случай, папка лежит внутри
+# стандартного Nextcloud-хранилища пользователя):
 #   sudo ./setup_depot_nginx.sh --domain dl.example.com \
 #       --nc-user SkyrimDownloader --depot-subpath "1TB/TESS/Instances"
+#
+# Использование (--alias-path — папка смонтирована как External Storage,
+# физически лежит ВНЕ datadirectory; occ не может подсказать, где именно
+# — это отдельная запись в БД Nextcloud, а не файл конфига; проще передать
+# путь на диске напрямую — найти его самому: `df -h` + `ls` от корня
+# внешнего диска вниз, пока не увидишь папку с chunks/ внутри):
+#   sudo ./setup_depot_nginx.sh --domain dl.example.com \
+#       --nc-user SkyrimDownloader \
+#       --alias-path /path/to/external/storage/mount/Instances
 #
 # Идемпотентен — повторный запуск с теми же аргументами безопасен
 # (перезаписывает конфиг nginx, htpasswd не трогает, если уже существует).
@@ -39,6 +49,7 @@ set -euo pipefail
 DOMAIN=""
 NC_USER=""
 DEPOT_SUBPATH=""
+ALIAS_PATH_OVERRIDE=""
 NC_WEB_USER="www-data"
 OCC_PATH=""
 PROJECT_DIR="/opt/tesl-depot"
@@ -51,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --domain)         DOMAIN="$2"; shift 2 ;;
         --nc-user)        NC_USER="$2"; shift 2 ;;
         --depot-subpath)  DEPOT_SUBPATH="$2"; shift 2 ;;
+        --alias-path)     ALIAS_PATH_OVERRIDE="$2"; shift 2 ;;
         --nc-web-user)    NC_WEB_USER="$2"; shift 2 ;;
         --occ)            OCC_PATH="$2"; shift 2 ;;
         --project-dir)    PROJECT_DIR="$2"; shift 2 ;;
@@ -72,8 +84,14 @@ if [[ $EUID -ne 0 ]]; then
     echo "Нужен root (sudo)." >&2
     exit 1
 fi
-if [[ -z "$DOMAIN" || -z "$NC_USER" || -z "$DEPOT_SUBPATH" ]]; then
-    echo "Обязательны: --domain --nc-user --depot-subpath" >&2
+if [[ -z "$DOMAIN" || -z "$NC_USER" ]]; then
+    echo "Обязательны: --domain --nc-user" >&2
+    exit 1
+fi
+if [[ -z "$DEPOT_SUBPATH" && -z "$ALIAS_PATH_OVERRIDE" ]]; then
+    echo "Нужен --depot-subpath (для обычного datadirectory) ИЛИ --alias-path (для" >&2
+    echo "внешнего хранилища Nextcloud — External Storage хранится ВНЕ datadirectory," >&2
+    echo "occ его физический путь не отдаёт, см. --alias-path ниже)." >&2
     exit 1
 fi
 
@@ -113,19 +131,34 @@ if echo "$ENC_STATUS" | grep -qi "enabled: true\|Encryption is enabled"; then
 fi
 echo "   ✅ Encryption выключено (или occ не смог явно подтвердить, что включено — вывод: $ENC_STATUS)"
 
-echo "== 4/8: Определяем datadirectory =="
-DATADIR="$(run_occ config:system:get datadirectory)"
-if [[ -z "$DATADIR" || ! -d "$DATADIR" ]]; then
-    echo "❌ Не удалось получить datadirectory через occ (получили: '$DATADIR')" >&2
-    exit 1
+echo "== 4/8: Определяем путь на диске =="
+if [[ -n "$ALIAS_PATH_OVERRIDE" ]]; then
+    # --alias-path задан явно — типичный случай, когда нужный путь смонтирован
+    # в Nextcloud как External Storage (Local), а не лежит внутри обычного
+    # datadirectory. occ отдаёт только "родной" datadirectory
+    # (config:system:get datadirectory) — где физически на диске примонтировано
+    # внешнее хранилище, это отдельная запись в БД Nextcloud (oc_storages/
+    # oc_mounts), которую эта команда не видит; проще и надёжнее взять путь от
+    # оператора напрямую, чем пытаться угадать/парсить БД. Подтверждено живьём
+    # 2026-09-22: WebDAV-корень депо оказался смонтирован как external storage
+    # на СОВСЕМ ДРУГОМ физическом диске, чем "родной" datadirectory сервера —
+    # см. TESL-Manager/CLAUDE.md за детали (не здесь, реальные пути — ДСП).
+    ALIAS_PATH="$ALIAS_PATH_OVERRIDE"
+    echo "   (--alias-path задан явно, occ/datadirectory не используются)"
+else
+    DATADIR="$(run_occ config:system:get datadirectory)"
+    if [[ -z "$DATADIR" || ! -d "$DATADIR" ]]; then
+        echo "❌ Не удалось получить datadirectory через occ (получили: '$DATADIR')" >&2
+        exit 1
+    fi
+    echo "   datadirectory: $DATADIR"
+    ALIAS_PATH="$DATADIR/$NC_USER/files/$DEPOT_SUBPATH"
 fi
-echo "   datadirectory: $DATADIR"
 
-ALIAS_PATH="$DATADIR/$NC_USER/files/$DEPOT_SUBPATH"
 echo "== 5/8: Проверяем итоговый путь =="
 echo "   $ALIAS_PATH"
 if [[ ! -d "$ALIAS_PATH" ]]; then
-    echo "❌ Директория не существует. Проверь --nc-user/--depot-subpath." >&2
+    echo "❌ Директория не существует. Проверь --nc-user/--depot-subpath (или --alias-path)." >&2
     exit 1
 fi
 # Не просто существование директории — ищем хотя бы одну реальную
@@ -136,7 +169,7 @@ fi
 # existence check").
 if ! find "$ALIAS_PATH" -maxdepth 2 -type d -name chunks | grep -q .; then
     echo "❌ Внутри $ALIAS_PATH не нашлось ни одной папки chunks/ на глубине 2." >&2
-    echo "   Похоже это не тот путь — сверь --depot-subpath с реальной структурой депо." >&2
+    echo "   Похоже это не тот путь — сверь --depot-subpath/--alias-path с реальной структурой депо." >&2
     exit 1
 fi
 echo "   ✅ Нашли минимум одну сборку с chunks/"
