@@ -1,0 +1,69 @@
+# ==================== nginx-depot-read.conf.template ====================
+# Read-only static раздача депо (chunks/versions/depot.json/src) — замена
+# прямого чтения через Nextcloud/WebDAV для лаунчера. Паблиш (запись)
+# остаётся через TESL-Manager -> Nextcloud WebDAV БЕЗ ИЗМЕНЕНИЙ, этот
+# сервер только ЧИТАЕТ те же файлы напрямую с диска. См.
+# setup_depot_nginx.sh и CLAUDE.md "Read-only nginx перед Cloudflare".
+#
+# Плейсхолдеры (__X__) заполняются setup_depot_nginx.sh — не редактировать
+# руками, не коммитить с реальными значениями (см. верх CLAUDE.md этого
+# репозитория — реальные серверные пути/домен — ДСП).
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name __DOMAIN__;
+
+    # Origin-сертификат Cloudflare (не Let's Encrypt/certbot — тот уже
+    # занят существующим сайтом/Nextcloud на этой же машине, трогать не
+    # надо). Публичный TLS для конечного пользователя терминируется на
+    # Cloudflare; сюда достаточно сертификата, которому доверяет только
+    # Cloudflare (SSL/TLS -> Origin Server -> Create Certificate в
+    # дэшборде, 15 лет, бесплатно).
+    ssl_certificate     __ORIGIN_CERT__;
+    ssl_certificate_key __ORIGIN_KEY__;
+
+    # Только чтение — ни PUT, ни DELETE, ни dav-модуль. Паблиш идёт
+    # отдельно, через Nextcloud WebDAV (TESL-Manager), эта раздача его
+    # не заменяет и не должна уметь писать.
+    root __ALIAS_PATH__;
+    autoindex off;
+
+    auth_basic           "TESL depot";
+    auth_basic_user_file __HTPASSWD_PATH__;
+
+    # Чанки — content-addressed (путь = sha256 содержимого), значит
+    # НАВСЕГДА неизменны под одним и тем же URL. Разрешаем Cloudflare/
+    # браузеру кэшировать бессрочно — реальный "CDN" эффект бесплатно,
+    # без строчки нового кода в лаунчере/менеджере.
+    location ~ ^/[^/]+/chunks/ {
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    # depot.json/versions/*.json/*.db/builds.json — МЕНЯЮТСЯ при каждой
+    # публикации новой версии. Кэшировать агрессивно нельзя — иначе
+    # лаунчер долго не увидит новый билд. Короткий TTL, не "no-store"
+    # (полностью без кэша Cloudflare всё равно не сможет отдавать с
+    # edge — короткий max-age даёт хоть какое-то сглаживание всплеска
+    # запросов при релизе, оставаясь свежим в пределах минуты).
+    location ~ \.(json|db)$ {
+        add_header Cache-Control "public, max-age=60" always;
+    }
+
+    # Range-запросы (докачка/resume) поддерживаются nginx для статики
+    # из коробки — ничего дополнительно настраивать не нужно.
+}
+
+# HTTP -> HTTPS редирект. Cloudflare сам форсирует HTTPS на своей
+# стороне при "Always Use HTTPS", но держим и на origin на случай
+# прямого обращения мимо Cloudflare (SSL/TLS mode = Full (strict) этого
+# и требует — origin должен сам поддерживать TLS, значит и порт 80
+# должен хотя бы редиректить, не отвечать голым HTTP с чувствительными
+# данными).
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+    return 301 https://$host$request_uri;
+}
