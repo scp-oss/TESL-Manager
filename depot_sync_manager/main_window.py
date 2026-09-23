@@ -162,6 +162,14 @@ class MainWindow(QMainWindow):
         self.static_tab.log_message.connect(self.log_message)
         self.tabs.addTab(self.static_tab, "📦 Статик-папки")
 
+        # Chunk-based депо (TESL-Panel/WebDAV, опционально с упаковкой чанков
+        # в pack-файлы) — независимый от ReleaseTab протокол публикации, см.
+        # depot_tab.py и CLAUDE.md "Упаковка чанков в pack-файлы".
+        from depot_tab import DepotTab
+        self.depot_tab = DepotTab(self)
+        self.depot_tab.log_message.connect(self.log_message)
+        self.tabs.addTab(self.depot_tab, "📦 Депо (chunks)")
+
         self.tabs.addTab(self._build_settings_tab(), "⚙️ Настройки")
         self.tabs.addTab(self._build_log_tab(), "📝 Лог")
 

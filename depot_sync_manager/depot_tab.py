@@ -1,11 +1,18 @@
 # ==================== depot_tab.py ====================
 """
-Вкладка "Депо" для main_window.
-Заменяет/дополняет стандартный flow синхронизации.
+Вкладка "Депо" для main_window — публикация через chunk-протокол
+(chunks/<xx>/<id> или, с 2026-09-23, упакованные pack-файлы, см.
+pack_writer.py) — независимо от старого компонентного протокола
+(ReleaseTab), свой backend (WebDAV ИЛИ TESL-Panel, см. panel_client.py)
+и своя локальная папка (НЕ переиспользует components из ReleaseTab —
+это другой протокол публикации, привязывать их друг к другу смысла
+нет: можно публиковать одну и ту же папку и старым, и новым способом
+независимо).
 
-Подключается к MainWindow:
+Подключается в main_window.py:
     self.depot_tab = DepotTab(self)
-    self.tab_widget.addTab(self.depot_tab, "📦 Депо")
+    self.depot_tab.log_message.connect(self.log_message)
+    self.tabs.addTab(self.depot_tab, "📦 Депо (chunks)")
 """
 import json
 from pathlib import Path
@@ -13,13 +20,14 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QComboBox, QLineEdit, QSpinBox, QFormLayout,
     QProgressBar, QTextEdit, QCheckBox, QSizePolicy, QFrame,
-    QMessageBox,
+    QMessageBox, QFileDialog, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from chunk_manager import DEFAULT_CHUNK_SIZE, DepotManifest, DepotDelta
 from depot_sync_manager import DepotBuildWorker, DepotSyncManager
+from pack_writer import DEFAULT_PACK_SIZE
 from depot_confirm_dialog import DepotConfirmDialog
 
 
@@ -43,9 +51,13 @@ CHUNK_SIZES = [
 
 CHANNELS = ["stable", "beta", "dev"]
 
+# "depot" — отдельный ключ в конфиге (независим от "webdav"/"components",
+# которыми пользуется ReleaseTab) — своя локальная папка, свой backend.
+CFG_KEY = "depot_tab"
+
 
 class DepotTab(QWidget):
-    """Вкладка управления depot-системой"""
+    """Вкладка управления chunk-based depot-системой."""
 
     log_message = pyqtSignal(str)   # пробрасываем в основной лог
 
@@ -54,16 +66,78 @@ class DepotTab(QWidget):
         self.mw = main_window   # ссылка на MainWindow для доступа к config
         self._worker: DepotBuildWorker = None
         self._thread: QThread = None
-        # Хранение результата scan для последующей передачи в upload-worker
+        self._btn_pause_state = False
         self._pending_manifest: DepotManifest = None
         self._pending_delta:    DepotDelta = None
         self._init_ui()
+        self._load_settings()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _init_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(10)
+
+        # ── Локальная папка ──────────────────────────────────────────────────
+        dir_box = QGroupBox("Локальная папка")
+        dir_row = QHBoxLayout(dir_box)
+        self.local_dir_edit = QLineEdit()
+        self.local_dir_edit.setPlaceholderText(r"P:\Games\skyrim\Skyrim")
+        dir_row.addWidget(self.local_dir_edit)
+        btn_browse = QPushButton("Обзор…")
+        btn_browse.clicked.connect(self._browse_folder)
+        dir_row.addWidget(btn_browse)
+        root.addWidget(dir_box)
+
+        # ── Куда публикуем ────────────────────────────────────────────────────
+        backend_box = QGroupBox("Куда публикуем")
+        backend_layout = QVBoxLayout(backend_box)
+
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItems(["TESL-Panel (напрямую, минуя Nextcloud)", "WebDAV (Nextcloud)"])
+        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        backend_layout.addWidget(self.backend_combo)
+
+        self.backend_stack = QStackedWidget()
+
+        # -- Panel fields --
+        panel_page = QWidget()
+        panel_form = QFormLayout(panel_page)
+        self.panel_url_edit = QLineEdit()
+        self.panel_url_edit.setPlaceholderText("https://tesl-panel.neth.de5.net")
+        self.panel_project_edit = QLineEdit()
+        self.panel_project_edit.setPlaceholderText("TESVAE")
+        self.panel_token_edit = QLineEdit()
+        self.panel_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        panel_form.addRow("URL панели:", self.panel_url_edit)
+        panel_form.addRow("Проект:", self.panel_project_edit)
+        panel_form.addRow("Upload-токен:", self.panel_token_edit)
+        self.backend_stack.addWidget(panel_page)
+
+        # -- WebDAV fields (независимы от тех, что в "⚙️ Настройки" —
+        #    та вкладка настраивает WebDAV для СТАРОГО компонентного
+        #    протокола ReleaseTab, здесь свой, специально под этот путь
+        #    публикации; можно указать тот же URL, можно другой) --
+        webdav_page = QWidget()
+        webdav_form = QFormLayout(webdav_page)
+        self.webdav_url_edit = QLineEdit()
+        self.webdav_url_edit.setPlaceholderText("https://host/cloud/remote.php/dav/files/user")
+        self.webdav_username_edit = QLineEdit()
+        self.webdav_password_edit = QLineEdit()
+        self.webdav_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.webdav_path_edit = QLineEdit()
+        self.webdav_path_edit.setPlaceholderText("1TB/TESS/Instances/TESVAE")
+        self.webdav_ssl_check = QCheckBox("Проверять SSL сертификат")
+        self.webdav_ssl_check.setChecked(True)
+        webdav_form.addRow("URL сервера:", self.webdav_url_edit)
+        webdav_form.addRow("Пользователь:", self.webdav_username_edit)
+        webdav_form.addRow("Пароль:", self.webdav_password_edit)
+        webdav_form.addRow("Путь на сервере:", self.webdav_path_edit)
+        webdav_form.addRow("", self.webdav_ssl_check)
+        self.backend_stack.addWidget(webdav_page)
+
+        backend_layout.addWidget(self.backend_stack)
+        root.addWidget(backend_box)
 
         # ── Настройки депо ────────────────────────────────────────────────────
         settings_box = QGroupBox("Настройки депо")
@@ -89,8 +163,22 @@ class DepotTab(QWidget):
         self.chunk_combo.setCurrentIndex(default_idx)
         form.addRow("Размер чанка:", self.chunk_combo)
 
-        self.btn_save_settings = QPushButton("💾 Сохранить настройки депо")
-        self.btn_save_settings.clicked.connect(self._save_depot_settings)
+        self.use_packs_check = QCheckBox(
+            "Упаковывать чанки в pack-файлы вместо chunks/<xx>/<id> "
+            "(меньше отдельных файлов на диске сервера)"
+        )
+        self.use_packs_check.setChecked(True)
+        self.use_packs_check.stateChanged.connect(self._on_use_packs_changed)
+        form.addRow("", self.use_packs_check)
+
+        self.pack_size_spin = QSpinBox()
+        self.pack_size_spin.setRange(16, 4096)
+        self.pack_size_spin.setSuffix(" MB")
+        self.pack_size_spin.setValue(DEFAULT_PACK_SIZE // 1024 // 1024)
+        form.addRow("Размер pack-файла:", self.pack_size_spin)
+
+        self.btn_save_settings = QPushButton("💾 Сохранить настройки")
+        self.btn_save_settings.clicked.connect(self._save_settings)
         form.addRow("", self.btn_save_settings)
 
         root.addWidget(settings_box)
@@ -172,45 +260,119 @@ class DepotTab(QWidget):
 
         root.addStretch()
 
-        # Загружаем сохранённые настройки
-        self._load_depot_settings()
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку для публикации")
+        if folder:
+            self.local_dir_edit.setText(folder)
+
+    def _on_backend_changed(self, idx: int):
+        self.backend_stack.setCurrentIndex(idx)
+
+    def _on_use_packs_changed(self, state):
+        self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
 
     # ── Settings persistence ──────────────────────────────────────────────────
+    # Отдельная секция конфига (CFG_KEY) — независима от "webdav"/
+    # "components", которыми пользуется ReleaseTab (старый протокол).
 
     def _get_config(self) -> dict:
         return self.mw.file_selector.config
 
-    def _load_depot_settings(self):
-        cfg = self._get_config().get("depot", {})
-        self.app_id_edit.setText(cfg.get("app_id", "my_app"))
-        self.depot_id_spin.setValue(cfg.get("depot_id", 1001))
-        ch = cfg.get("channel", "stable")
+    def _load_settings(self):
+        cfg = self._get_config().get(CFG_KEY, {})
+
+        self.local_dir_edit.setText(cfg.get("local_dir", ""))
+        self.backend_combo.setCurrentIndex(0 if cfg.get("backend", "panel") == "panel" else 1)
+        self.backend_stack.setCurrentIndex(self.backend_combo.currentIndex())
+
+        panel = cfg.get("panel", {})
+        self.panel_url_edit.setText(panel.get("base_url", ""))
+        self.panel_project_edit.setText(panel.get("project", ""))
+        self.panel_token_edit.setText(panel.get("token", ""))
+
+        webdav = cfg.get("webdav", {})
+        self.webdav_url_edit.setText(webdav.get("server_url", ""))
+        self.webdav_username_edit.setText(webdav.get("username", ""))
+        self.webdav_password_edit.setText(webdav.get("password", ""))
+        self.webdav_path_edit.setText(webdav.get("remote_path", ""))
+        self.webdav_ssl_check.setChecked(webdav.get("verify_ssl", True))
+
+        depot = cfg.get("depot", {})
+        self.app_id_edit.setText(depot.get("app_id", "my_app"))
+        self.depot_id_spin.setValue(depot.get("depot_id", 1001))
+        ch = depot.get("channel", "stable")
         idx = self.channel_combo.findText(ch)
         if idx >= 0:
             self.channel_combo.setCurrentIndex(idx)
-        # Выбираем размер чанка
-        target_size = cfg.get("chunk_size", DEFAULT_CHUNK_SIZE)
+        target_size = depot.get("chunk_size", DEFAULT_CHUNK_SIZE)
         for i, (_, size) in enumerate(CHUNK_SIZES):
             if size == target_size:
                 self.chunk_combo.setCurrentIndex(i)
                 break
 
-    def _save_depot_settings(self):
-        cfg = self._get_config()
-        cfg["depot"] = {
-            "app_id":     self.app_id_edit.text().strip() or "my_app",
-            "depot_id":   self.depot_id_spin.value(),
-            "channel":    self.channel_combo.currentText(),
-            "chunk_size": CHUNK_SIZES[self.chunk_combo.currentIndex()][1],
+        self.use_packs_check.setChecked(cfg.get("use_packs", True))
+        self.pack_size_spin.setValue(depot.get("pack_size", DEFAULT_PACK_SIZE) // 1024 // 1024)
+        self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
+
+    def _build_runtime_config(self) -> dict:
+        """Собирает config-словарь ровно в форме, которую ожидает
+        DepotSyncManager (backend/panel/webdav/use_packs/depot/local_dir/
+        excludes) — та же схема, что publish_packed.py собирал вручную."""
+        backend = "panel" if self.backend_combo.currentIndex() == 0 else "webdav"
+        return {
+            "backend": backend,
+            "use_packs": self.use_packs_check.isChecked(),
+            "panel": {
+                "base_url": self.panel_url_edit.text().strip().rstrip("/"),
+                "project":  self.panel_project_edit.text().strip(),
+                "token":    self.panel_token_edit.text(),
+                "verify_ssl": True,
+            },
+            "webdav": {
+                "server_url":  self.webdav_url_edit.text().strip().rstrip("/"),
+                "username":    self.webdav_username_edit.text().strip(),
+                "password":    self.webdav_password_edit.text(),
+                "remote_path": self.webdav_path_edit.text().strip().strip("/"),
+                "verify_ssl":  self.webdav_ssl_check.isChecked(),
+            },
+            "depot": {
+                "app_id":     self.app_id_edit.text().strip() or "my_app",
+                "depot_id":   self.depot_id_spin.value(),
+                "channel":    self.channel_combo.currentText(),
+                "chunk_size": CHUNK_SIZES[self.chunk_combo.currentIndex()][1],
+                "pack_size":  self.pack_size_spin.value() * 1024 * 1024,
+            },
+            "local_dir": self.local_dir_edit.text().strip(),
+            "excludes": [],
         }
+
+    def _save_settings(self):
+        cfg = self._get_config()
+        runtime = self._build_runtime_config()
+        cfg[CFG_KEY] = runtime
         self.mw.file_selector.save_config()
         self._log("✅ Настройки депо сохранены")
 
     # ── Connection test ───────────────────────────────────────────────────────
 
+    def _validate_backend(self, cfg: dict) -> str:
+        """Возвращает текст ошибки или "" если конфиг backend'а достаточен
+        для сетевого запроса."""
+        if cfg["backend"] == "panel":
+            if not cfg["panel"]["base_url"] or not cfg["panel"]["project"]:
+                return "Заполните URL панели и имя проекта!"
+        else:
+            if not cfg["webdav"]["server_url"]:
+                return "Заполните URL WebDAV сервера!"
+        return ""
+
     def _test_connection(self):
+        cfg = self._build_runtime_config()
+        err = self._validate_backend(cfg)
+        if err:
+            QMessageBox.warning(self, "Ошибка", err)
+            return
         self._log("🔌 Проверяем соединение...")
-        cfg = self._get_config()
         sync = DepotSyncManager(cfg)
         ok, msg = sync.test_connection()
         sync.close()
@@ -222,8 +384,12 @@ class DepotTab(QWidget):
             self._log(f"❌ {msg}")
 
     def _fetch_server_info(self):
+        cfg = self._build_runtime_config()
+        err = self._validate_backend(cfg)
+        if err:
+            QMessageBox.warning(self, "Ошибка", err)
+            return
         self._log("📥 Запрашиваем инфо с сервера...")
-        cfg = self._get_config()
         sync = DepotSyncManager(cfg)
         manifest = sync.fetch_remote_manifest()
         sync.close()
@@ -247,16 +413,19 @@ class DepotTab(QWidget):
 
     def _start_build(self):
         """Запуск фазы сканирования. После — показ диалога подтверждения."""
-        cfg = self._get_config()
-        if not cfg.get("local_dir"):
+        cfg = self._build_runtime_config()
+        if not cfg["local_dir"]:
             QMessageBox.warning(self, "Ошибка", "Выберите локальную папку!")
             return
-        if not cfg.get("webdav", {}).get("server_url"):
-            QMessageBox.warning(self, "Ошибка", "Настройте WebDAV сервер!")
+        if not Path(cfg["local_dir"]).is_dir():
+            QMessageBox.warning(self, "Ошибка", f"Папка не найдена: {cfg['local_dir']}")
+            return
+        err = self._validate_backend(cfg)
+        if err:
+            QMessageBox.warning(self, "Ошибка", err)
             return
 
-        # Сохраняем depot settings перед запуском
-        self._save_depot_settings()
+        self._save_settings()
 
         self._set_ui_busy(True)
         self.progress_bar.setRange(0, 0)
@@ -276,7 +445,6 @@ class DepotTab(QWidget):
 
     def _on_scan_done(self, new_manifest: DepotManifest, delta: DepotDelta, prev_manifest):
         """Сканирование завершено — показываем диалог подтверждения"""
-        # Останавливаем индикатор
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
 
@@ -285,7 +453,6 @@ class DepotTab(QWidget):
             self._on_finished(True, "Депо актуально")
             return
 
-        # Сохраняем для upload-воркера
         self._pending_manifest = new_manifest
         self._pending_delta    = delta
 
@@ -304,7 +471,7 @@ class DepotTab(QWidget):
 
     def _start_upload(self, manifest: DepotManifest, delta: DepotDelta):
         """Запуск фазы загрузки чанков"""
-        cfg = self._get_config()
+        cfg = self._build_runtime_config()
 
         self.progress_bar.setRange(0, 0)
         self._log("📤 Начинаем загрузку чанков...")
@@ -390,5 +557,4 @@ class DepotTab(QWidget):
         self.log_edit.verticalScrollBar().setValue(
             self.log_edit.verticalScrollBar().maximum()
         )
-        # Пробрасываем в основной лог MainWindow
         self.log_message.emit(msg)
