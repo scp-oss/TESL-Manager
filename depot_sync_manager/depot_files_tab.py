@@ -162,7 +162,7 @@ class DepotFilesTab(QWidget):
 
         conn_box = QGroupBox("Проект на панели")
         conn_row = QHBoxLayout(conn_box)
-        conn_row.addWidget(QLabel("Проект:"))
+        conn_row.addWidget(QLabel("Сборка:"))
         self.project_combo = QComboBox()
         self.project_combo.setEditable(False)
         self.project_combo.setMinimumWidth(200)
@@ -230,12 +230,12 @@ class DepotFilesTab(QWidget):
     def _panel_cfg(self) -> dict:
         return self.mw.file_selector.config.get("panel", {})
 
-    def _make_client(self, project: str):
+    def _make_client(self, build_id: str):
         from panel_client import PanelHTTP
         cfg = self._panel_cfg()
         return PanelHTTP(
             base_url   = cfg.get("base_url", "").rstrip("/"),
-            project    = project,
+            build_id   = build_id,
             token      = cfg.get("token", ""),
             verify_ssl = cfg.get("verify_ssl", True),
         )
@@ -245,7 +245,10 @@ class DepotFilesTab(QWidget):
         if self.project_combo.count() == 0:
             self._refresh_projects()
 
-    # ── Projects ─────────────────────────────────────────────────────────────
+    # ── Сборки ───────────────────────────────────────────────────────────────
+    # project_combo хранит build_id в itemData (Qt.ItemDataRole.UserRole),
+    # показывает имя — реальный ключ id, не строка (см. TESL-Panel's
+    # builds_db.py и CLAUDE.md, тот же принцип, что и DepotTab.build_combo).
 
     def _refresh_projects(self):
         cfg = self._panel_cfg()
@@ -255,23 +258,24 @@ class DepotFilesTab(QWidget):
             )
             return
         client = self._make_client("")
-        names = client.list_projects()
+        builds = client.list_builds()
         client.close()
-        current = self.project_combo.currentText()
+        current_id = self.project_combo.currentData()
         self.project_combo.clear()
-        self.project_combo.addItems(names)
-        if current:
-            idx = self.project_combo.findText(current)
+        for b in builds:
+            self.project_combo.addItem(b["name"], b["id"])
+        if current_id:
+            idx = self.project_combo.findData(current_id)
             if idx >= 0:
                 self.project_combo.setCurrentIndex(idx)
-        self.log_message.emit(f"📋 Проектов на панели: {len(names)}")
+        self.log_message.emit(f"📋 Сборок на панели: {len(builds)}")
 
     # ── Load files ───────────────────────────────────────────────────────────
 
     def _load_files(self):
-        project = self.project_combo.currentText().strip()
-        if not project:
-            QMessageBox.warning(self, "Ошибка", "Выберите проект")
+        build_id = self.project_combo.currentData()
+        if not build_id:
+            QMessageBox.warning(self, "Ошибка", "Выберите сборку")
             return
         cfg = self._panel_cfg()
         if not cfg.get("base_url") or not cfg.get("token"):
@@ -281,9 +285,10 @@ class DepotFilesTab(QWidget):
             )
             return
 
-        self._client = self._make_client(project)
+        self._client = self._make_client(build_id)
         self._set_busy(True)
-        self.status_label.setText(f"Загружаем список файлов проекта «{project}»…")
+        name = self.project_combo.currentText()
+        self.status_label.setText(f"Загружаем список файлов сборки «{name}»…")
 
         self._worker = _ListWorker(self._client)
         self._thread = QThread()
@@ -341,21 +346,21 @@ class DepotFilesTab(QWidget):
     # ── Upload ───────────────────────────────────────────────────────────────
 
     def _upload_file(self):
-        project = self.project_combo.currentText().strip()
-        if not project:
-            QMessageBox.warning(self, "Ошибка", "Выберите проект")
+        build_id = self.project_combo.currentData()
+        if not build_id:
+            QMessageBox.warning(self, "Ошибка", "Выберите сборку")
             return
         local_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл для загрузки")
         if not local_path:
             return
         default_rel = Path(local_path).name
-        rel_path = default_rel  # простая схема — кладём в корень проекта,
+        rel_path = default_rel  # простая схема — кладём в корень сборки,
         # для произвольного пути внутри дерева переименуйте/переместите
         # локально перед выбором либо используйте «🚀 Релизы» для
         # обычной публикации сборки — эта кнопка для отдельных файлов
         # (readme, poster.png и т.п.), не для чанков.
 
-        client = self._make_client(project)
+        client = self._make_client(build_id)
         data = Path(local_path).read_bytes()
         self._set_busy(True)
         self.status_label.setText(f"Загружаем {rel_path}…")

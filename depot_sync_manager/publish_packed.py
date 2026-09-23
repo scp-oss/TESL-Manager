@@ -31,7 +31,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--local-dir", required=True, help="Локальная папка для публикации")
     ap.add_argument("--panel-url", required=True, help="Например https://tesl-panel.neth.de5.net")
-    ap.add_argument("--project", required=True, help="Имя проекта на панели (см. /admin)")
+    ap.add_argument("--project", required=True, help="Имя сборки на панели (см. /admin) — создаётся, если ещё не существует")
     ap.add_argument("--token", required=True, help="Upload-токен панели")
     ap.add_argument("--app-id", default="app")
     ap.add_argument("--channel", default="stable")
@@ -54,11 +54,30 @@ def main() -> int:
     if args.pack_size:
         depot_cfg["pack_size"] = args.pack_size
 
+    # Панель адресует сборки по id (UUID), не по имени, см. TESL-Panel's
+    # builds_db.py — --project здесь остаётся именем ради удобства CLI,
+    # резолвится/создаётся через /api/builds перед публикацией.
+    from panel_client import PanelHTTP
+    lookup = PanelHTTP(
+        base_url=args.panel_url, build_id="", token=args.token,
+        verify_ssl=not args.no_verify_ssl,
+    )
+    build = next((b for b in lookup.list_builds() if b["name"] == args.project), None)
+    if build is None:
+        print(f"ℹ️  Сборка «{args.project}» не найдена на панели — создаю…")
+        build, err = lookup.create_build(args.project)
+        if build is None:
+            print(f"❌ Не удалось создать сборку: {err}", file=sys.stderr)
+            return 1
+    lookup.close()
+    build_id = build["id"]
+    print(f"📦 Сборка: {args.project} ({build_id[:8]})")
+
     config = {
         "backend": "panel",
         "panel": {
             "base_url": args.panel_url,
-            "project": args.project,
+            "build_id": build_id,
             "token": args.token,
             "verify_ssl": not args.no_verify_ssl,
         },

@@ -105,12 +105,12 @@ class StatusBar(QFrame):
         backend = cfg.get("backend", "panel")
         if backend == "panel":
             panel = cfg.get("panel", {})
-            base_url = panel.get("base_url", "")
-            project  = panel.get("project", "")
-            if base_url and project:
+            base_url   = panel.get("base_url", "")
+            build_name = panel.get("build_name", "")
+            if base_url and build_name:
                 from urllib.parse import urlparse
                 host = urlparse(base_url).netloc or base_url
-                self.lbl_backend.setText(f"TESL-Panel: {host} → {project}")
+                self.lbl_backend.setText(f"TESL-Panel: {host} → {build_name}")
             else:
                 self.lbl_backend.setText("TESL-Panel: не настроено")
         else:
@@ -161,21 +161,41 @@ class MainWindow(QMainWindow):
     def _migrate_legacy_backend_config(self):
         cfg = self.config
         old = cfg.get("depot_tab", {})
-        if not old:
-            return
-        if "backend" not in cfg and old.get("backend"):
-            cfg["backend"] = old["backend"]
-        if "panel" not in cfg and old.get("panel", {}).get("base_url"):
-            cfg["panel"] = old["panel"]
-        if not cfg.get("webdav", {}).get("server_url") and old.get("webdav", {}).get("server_url"):
-            cfg["webdav"] = old["webdav"]
-        if "depot_publish" not in cfg:
-            d = old.get("depot", {})
-            cfg["depot_publish"] = {
-                "use_packs":  old.get("use_packs", True),
-                "chunk_size": d.get("chunk_size", DEFAULT_CHUNK_SIZE),
-                "pack_size":  d.get("pack_size", DEFAULT_PACK_SIZE),
-            }
+        if old:
+            if "backend" not in cfg and old.get("backend"):
+                cfg["backend"] = old["backend"]
+            if "panel" not in cfg and old.get("panel", {}).get("base_url"):
+                cfg["panel"] = old["panel"]
+            if not cfg.get("webdav", {}).get("server_url") and old.get("webdav", {}).get("server_url"):
+                cfg["webdav"] = old["webdav"]
+            if "depot_publish" not in cfg:
+                d = old.get("depot", {})
+                cfg["depot_publish"] = {
+                    "use_packs":  old.get("use_packs", True),
+                    "chunk_size": d.get("chunk_size", DEFAULT_CHUNK_SIZE),
+                    "pack_size":  d.get("pack_size", DEFAULT_PACK_SIZE),
+                }
+
+        # Более поздняя миграция (2026-09-23, тем же вечером) — НЕ зависит
+        # от "if old" выше (нужна и тем, у кого cfg["panel"] уже был
+        # верхнеуровневым с этой же сессии, без старого cfg["depot_tab"]
+        # вообще): cfg["panel"]
+        # раньше хранил "project" — ИМЯ сборки как строку. TESL-Panel's
+        # builds_db.py сделал id реальным ключом (прямой запрос
+        # пользователя — имя не должно быть ключом связи между панелью и
+        # менеджером) — старое имя нельзя надёжно превратить в id офлайн
+        # (сетевого похода на панель здесь, при старте, делать не
+        # хотим) — просто убираем его, чтобы не притвориться валидным
+        # build_id и не словить непонятный 404. Пользователю нужно будет
+        # заново выбрать сборку в комбобоксе на "Релизы" — один раз,
+        # список подтянется тем же способом, что и раньше.
+        panel = cfg.get("panel", {})
+        if "project" in panel and "build_id" not in panel:
+            panel = dict(panel)
+            panel.pop("project", None)
+            panel.setdefault("build_id", "")
+            panel.setdefault("build_name", "")
+            cfg["panel"] = panel
         # Больше не сохраняем backend/panel/depot внутри depot_tab — только
         # components/channel там теперь и нужны (см. depot_tab.py).
         for stale_key in ("backend", "panel", "webdav", "depot", "use_packs"):
@@ -548,16 +568,19 @@ class MainWindow(QMainWindow):
         panel_cfg = {
             "base_url":   decoded["base_url"],
             "token":      decoded["token"],
-            "project":    cfg.get("panel", {}).get("project", ""),
+            "build_id":   cfg.get("panel", {}).get("build_id", ""),
+            "build_name": cfg.get("panel", {}).get("build_name", ""),
             "verify_ssl": True,
         }
-        # Другой адрес панели — старый выбранный проект почти наверняка
-        # относится к другой панели, список нужно перезагрузить с нуля,
-        # а не молча оставлять невалидный выбор. Сам combo выбора сборки
-        # живёт теперь на странице "Релизы" (DepotTab.build_combo), не
-        # здесь — см. её же _refresh_builds()/_create_new_build().
+        # Другой адрес панели — старая выбранная сборка почти наверняка
+        # относится к другой панели (id из одной БД builds.db бессмыслен
+        # для другой), список нужно перезагрузить с нуля, а не молча
+        # оставлять невалидный выбор. Сам combo выбора сборки живёт
+        # теперь на странице "Релизы" (DepotTab.build_combo), не здесь —
+        # см. её же _refresh_builds()/_create_new_build().
         if decoded["base_url"] != old_base_url:
-            panel_cfg["project"] = ""
+            panel_cfg["build_id"]   = ""
+            panel_cfg["build_name"] = ""
             self.depot_tab.build_combo.clear()
 
         cfg["panel"] = panel_cfg

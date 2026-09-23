@@ -415,7 +415,7 @@ class DepotSyncManager(QObject):
                 cfg = self.panel_cfg
                 self._dav = PanelHTTP(
                     base_url   = cfg.get("base_url", ""),
-                    project    = cfg.get("project", ""),
+                    build_id   = cfg.get("build_id", ""),
                     token      = cfg.get("token", ""),
                     verify_ssl = cfg.get("verify_ssl", True),
                 )

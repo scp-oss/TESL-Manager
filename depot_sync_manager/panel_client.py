@@ -63,15 +63,22 @@ def encode_setup_code(base_url: str, token: str) -> str:
 
 
 class PanelHTTP:
+    """build_id — стабильный UUID из TESL-Panel's builds_db.py (2026-09-23:
+    прямой запрос пользователя, имя сборки не должно быть ключом связи
+    между панелью и менеджером, поскольку сборки создаются независимо в
+    обоих местах — нужен настоящий id). Имя остаётся только для отображения
+    (например, DepotManifest.app_id) — все реальные /api/depot/... пути
+    идут по build_id."""
+
     def __init__(
         self,
         base_url:   str,
-        project:    str,
+        build_id:   str,
         token:      str,
         verify_ssl: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
-        self.project  = project
+        self.build_id = build_id
         self.session  = requests.Session()
         self.session.verify = verify_ssl
         self.session.headers.update({
@@ -81,7 +88,7 @@ class PanelHTTP:
         self.last_response = None
 
     def _url(self, rel_path: str) -> str:
-        return f"{self.base_url}/api/depot/{self.project}/{rel_path.strip('/')}"
+        return f"{self.base_url}/api/depot/{self.build_id}/{rel_path.strip('/')}"
 
     def _retry(self, fn, *args, **kwargs):
         last_exc = None
@@ -141,13 +148,13 @@ class PanelHTTP:
             return None
 
     def list_chunk_ids(self, chunks_path: str = "") -> Set[str]:
-        # chunks_path игнорируется — на панели один project = одна папка
+        # chunks_path игнорируется — на панели одна сборка = одна папка
         # chunks/, отдельный listing-эндпоинт уже знает, где искать (см.
         # TESL-Panel::panel/app.py depot_list_chunks).
         try:
             r = self._retry(
                 self.session.get,
-                f"{self.base_url}/api/depot/{self.project}/chunks",
+                f"{self.base_url}/api/depot/{self.build_id}/chunks",
                 timeout=TIMEOUT_GET,
             )
             self.last_response = r
@@ -160,7 +167,7 @@ class PanelHTTP:
     def test_connection(self) -> Tuple[bool, str]:
         try:
             r = self.session.get(
-                f"{self.base_url}/api/depot/{self.project}/test",
+                f"{self.base_url}/api/depot/{self.build_id}/test",
                 timeout=TIMEOUT_CONNECT,
             )
             self.last_response = r
@@ -169,7 +176,7 @@ class PanelHTTP:
             if r.status_code == 401:
                 return False, "Неверный upload-токен"
             if r.status_code == 404:
-                return False, f"Неизвестный project на панели: {self.project}"
+                return False, f"Неизвестная сборка на панели: {self.build_id}"
             if r.status_code == 503:
                 return False, "Панель не сконфигурирована для приёма публикаций (нет upload-токена на сервере)"
             return False, f"HTTP {r.status_code}"
@@ -182,31 +189,59 @@ class PanelHTTP:
         except Exception as e:
             return False, str(e)
 
-    # ── Проекты / файлы (для GUI: серверный список проектов и вкладка
-    #    "Файлы на сервере" — см. TESL-Panel::panel/app.py /api/projects и
-    #    /api/depot/<project>/files, добавленные 2026-09-23 именно под эту
-    #    нужду) ──────────────────────────────────────────────────────────────
+    # ── Сборки / файлы (для GUI: серверный список/создание/удаление/
+    #    переименование сборок и вкладка "Файлы на сервере" — см.
+    #    TESL-Panel::panel/app.py /api/builds и /api/depot/<build_id>/files,
+    #    build_id — реальный ключ везде, имя только для отображения) ────────
 
-    def list_projects(self) -> List[str]:
+    def list_builds(self) -> List[dict]:
+        """[{"id": ..., "name": ..., "created_at": ...}, ...]"""
         try:
-            r = self.session.get(f"{self.base_url}/api/projects", timeout=TIMEOUT_CONNECT)
+            r = self.session.get(f"{self.base_url}/api/builds", timeout=TIMEOUT_CONNECT)
             self.last_response = r
             if r.status_code != 200:
                 return []
-            return list(r.json().get("projects", []))
+            return list(r.json().get("builds", []))
         except Exception:
             return []
 
-    def create_project(self, name: str) -> Tuple[bool, str]:
+    def create_build(self, name: str) -> Tuple[Optional[dict], str]:
+        """(build_dict, "") при успехе, (None, причина) при отказе."""
         try:
             r = self.session.post(
-                f"{self.base_url}/api/projects", json={"name": name}, timeout=TIMEOUT_CONNECT,
+                f"{self.base_url}/api/builds", json={"name": name}, timeout=TIMEOUT_CONNECT,
             )
             self.last_response = r
             if r.status_code == 201:
-                return True, "Проект создан"
+                return r.json(), ""
             if r.status_code == 401:
-                return False, "Неверный upload-токен"
+                return None, "Неверный upload-токен"
+            try:
+                return None, r.json().get("description", f"HTTP {r.status_code}")
+            except Exception:
+                return None, f"HTTP {r.status_code}"
+        except Exception as e:
+            return None, str(e)
+
+    def delete_build(self, build_id: str) -> bool:
+        try:
+            r = self.session.delete(
+                f"{self.base_url}/api/builds/{build_id}", timeout=TIMEOUT_CONNECT,
+            )
+            self.last_response = r
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def rename_build(self, build_id: str, new_name: str) -> Tuple[bool, str]:
+        try:
+            r = self.session.patch(
+                f"{self.base_url}/api/builds/{build_id}",
+                json={"name": new_name}, timeout=TIMEOUT_CONNECT,
+            )
+            self.last_response = r
+            if r.status_code == 200:
+                return True, ""
             try:
                 return False, r.json().get("description", f"HTTP {r.status_code}")
             except Exception:
@@ -214,13 +249,13 @@ class PanelHTTP:
         except Exception as e:
             return False, str(e)
 
-    def list_files(self, project: Optional[str] = None) -> Optional[List[dict]]:
-        """[{"path": ..., "size": ...}, ...] для проекта — если project не
-        задан, используется self.project (см. __init__)."""
-        proj = project or self.project
+    def list_files(self, build_id: Optional[str] = None) -> Optional[List[dict]]:
+        """[{"path": ..., "size": ...}, ...] для сборки — если build_id не
+        задан, используется self.build_id (см. __init__)."""
+        bid = build_id or self.build_id
         try:
             r = self.session.get(
-                f"{self.base_url}/api/depot/{proj}/files", timeout=TIMEOUT_GET,
+                f"{self.base_url}/api/depot/{bid}/files", timeout=TIMEOUT_GET,
             )
             self.last_response = r
             if r.status_code != 200:

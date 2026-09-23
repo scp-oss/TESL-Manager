@@ -74,15 +74,19 @@ class DepotTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        # ── Сборка (проект на панели) ────────────────────────────────────────
+        # ── Сборка (build на панели) ─────────────────────────────────────────
         # Прямой запрос пользователя: выбрать существующую сборку или
         # добавить новую с именем — прямо здесь, на странице "Релизы", а
         # не только на "Настройках" (там остаётся код подключения к
-        # панели самой — URL/токен, см. main_window.py). "Сборка" — то же
-        # понятие, что TESL-Panel называет "проект"
-        # (panel/templates/admin.html: заголовок "Сборки") — combo пишет
-        # в тот же cfg["panel"]["project"], который читает
-        # _build_runtime_config() ниже.
+        # панели самой — URL/токен, см. main_window.py). Реальный ключ —
+        # build_id (UUID из TESL-Panel's builds_db.py, см. её CLAUDE.md
+        # "проект в панели и в менеджере не надо указывать как ключ" —
+        # имя не может быть ключом связи, раз сборки создаются независимо
+        # в обоих местах); combo хранит id в itemData
+        # (Qt.ItemDataRole.UserRole), показывает имя. Пишет в
+        # cfg["panel"]["build_id"]/["build_name"], которые читает
+        # _build_runtime_config() ниже. Полноценное управление —
+        # создать/удалить/переименовать, не только выбрать.
         build_box = QGroupBox("Сборка")
         build_row = QHBoxLayout(build_box)
         self.build_combo = QComboBox()
@@ -94,9 +98,16 @@ class DepotTab(QWidget):
         btn_refresh_build.setToolTip("Обновить список сборок с сервера")
         btn_refresh_build.clicked.connect(self._refresh_builds)
         build_row.addWidget(btn_refresh_build)
-        btn_new_build = QPushButton("➕ Новая сборка")
+        btn_new_build = QPushButton("➕ Новая")
+        btn_new_build.setToolTip("Создать новую сборку на панели")
         btn_new_build.clicked.connect(self._create_new_build)
         build_row.addWidget(btn_new_build)
+        btn_rename_build = QPushButton("✏️ Переименовать")
+        btn_rename_build.clicked.connect(self._rename_current_build)
+        build_row.addWidget(btn_rename_build)
+        btn_delete_build = QPushButton("🗑 Удалить")
+        btn_delete_build.clicked.connect(self._delete_current_build)
+        build_row.addWidget(btn_delete_build)
         root.addWidget(build_box)
 
         # ── Компоненты сборки (Skyrim / MO2p / MO2ext) ──────────────────────
@@ -229,19 +240,35 @@ class DepotTab(QWidget):
         if idx >= 0:
             self.channel_combo.setCurrentIndex(idx)
 
-        saved_project = self._get_config().get("panel", {}).get("project", "")
-        if saved_project:
+        saved_id   = self._get_config().get("panel", {}).get("build_id", "")
+        saved_name = self._get_config().get("panel", {}).get("build_name", "")
+        if saved_id and saved_name:
             self.build_combo.blockSignals(True)
-            self.build_combo.addItem(saved_project)
+            self.build_combo.addItem(saved_name, saved_id)
             self.build_combo.setCurrentIndex(0)
             self.build_combo.blockSignals(False)
 
-    # ── Build (project) selection ─────────────────────────────────────────────
+    # ── Build selection / management ────────────────────────────────────────
+    # build_id (itemData, Qt.ItemDataRole.UserRole) — реальный ключ, пишется
+    # в cfg["panel"]["build_id"]; имя (текст пункта) — только для показа,
+    # дублируется в cfg["panel"]["build_name"] ради status_panel/app_id, без
+    # лишнего сетевого похода за именем каждый раз.
+
+    def _current_build_id(self) -> str:
+        return self.build_combo.currentData() or ""
+
+    def _make_client(self, panel_cfg: dict, build_id: str = ""):
+        from panel_client import PanelHTTP
+        return PanelHTTP(
+            base_url=panel_cfg.get("base_url", ""), build_id=build_id,
+            token=panel_cfg.get("token", ""), verify_ssl=panel_cfg.get("verify_ssl", True),
+        )
 
     def _save_build_choice(self, _idx: int = 0):
         cfg = self._get_config()
         panel = dict(cfg.get("panel", {}))
-        panel["project"] = self.build_combo.currentText().strip()
+        panel["build_id"]   = self.build_combo.currentData() or ""
+        panel["build_name"] = self.build_combo.currentText().strip()
         cfg["panel"] = panel
         self.mw.file_selector.save_config()
         if hasattr(self.mw, "status_panel"):
@@ -252,20 +279,27 @@ class DepotTab(QWidget):
         if not panel.get("base_url"):
             QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к панели на странице «⚙️ Настройки»!")
             return
-        from panel_client import PanelHTTP
-        client = PanelHTTP(base_url=panel["base_url"], project="", token=panel.get("token", ""))
-        names = client.list_projects()
+        client = self._make_client(panel)
+        builds = client.list_builds()
         client.close()
-        current = self.build_combo.currentText()
+        current_id = self._current_build_id()
         self.build_combo.blockSignals(True)
         self.build_combo.clear()
-        self.build_combo.addItems(names)
-        if current:
-            idx = self.build_combo.findText(current)
+        for b in builds:
+            self.build_combo.addItem(b["name"], b["id"])
+        if current_id:
+            idx = self.build_combo.findData(current_id)
             if idx >= 0:
                 self.build_combo.setCurrentIndex(idx)
         self.build_combo.blockSignals(False)
-        self._log(f"📋 Сборок на панели: {len(names)}")
+        # blockSignals() выше означает, что currentIndexChanged НЕ дошёл
+        # до _save_build_choice(), даже если реальный текущий выбор
+        # изменился (например, новый список — первый addItem() уже
+        # выставляет currentIndex=0 сам по себе, событие для этого
+        # никогда не всплывёт естественным путём) — сохраняем явно,
+        # а не полагаемся на сигнал.
+        self._save_build_choice()
+        self._log(f"📋 Сборок на панели: {len(builds)}")
 
     def _create_new_build(self):
         panel = self._backend_cfg()["panel"]
@@ -276,18 +310,72 @@ class DepotTab(QWidget):
         name = (name or "").strip()
         if not ok or not name:
             return
-        from panel_client import PanelHTTP
-        client = PanelHTTP(base_url=panel["base_url"], project="", token=panel.get("token", ""))
-        created, msg = client.create_project(name)
+        client = self._make_client(panel)
+        build, msg = client.create_build(name)
         client.close()
-        if created:
-            self._log(f"✅ Сборка создана: {name}")
+        if build:
+            self._log(f"✅ Сборка создана: {build['name']} ({build['id'][:8]})")
             self._refresh_builds()
-            idx = self.build_combo.findText(name)
+            idx = self.build_combo.findData(build["id"])
             if idx >= 0:
+                # setCurrentIndex() тоже может быть no-op, если _refresh_builds()
+                # уже выставил тот же индекс (см. её же комментарий выше) —
+                # _save_build_choice() гарантирует запись независимо от того,
+                # дошёл сигнал или нет.
                 self.build_combo.setCurrentIndex(idx)
+            self._save_build_choice()
         else:
             QMessageBox.warning(self, "Ошибка", msg)
+
+    def _rename_current_build(self):
+        build_id = self._current_build_id()
+        if not build_id:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите сборку")
+            return
+        old_name = self.build_combo.currentText()
+        new_name, ok = QInputDialog.getText(
+            self, "Переименовать сборку", "Новое имя (буквы/цифры/_/-):", text=old_name,
+        )
+        new_name = (new_name or "").strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        panel = self._backend_cfg()["panel"]
+        client = self._make_client(panel, build_id)
+        ok2, msg = client.rename_build(build_id, new_name)
+        client.close()
+        if ok2:
+            self._log(f"✅ Сборка переименована: {old_name} → {new_name}")
+            self._refresh_builds()
+            idx = self.build_combo.findData(build_id)
+            if idx >= 0:
+                self.build_combo.setCurrentIndex(idx)
+            self._save_build_choice()
+        else:
+            QMessageBox.warning(self, "Ошибка", msg)
+
+    def _delete_current_build(self):
+        build_id = self._current_build_id()
+        if not build_id:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите сборку")
+            return
+        name = self.build_combo.currentText()
+        ans = QMessageBox.question(
+            self, "Удаление сборки",
+            f"Удалить сборку <b>{name}</b> с панели? Это необратимо удалит "
+            f"ВСЕ её чанки и версии на сервере.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        panel = self._backend_cfg()["panel"]
+        client = self._make_client(panel, build_id)
+        ok = client.delete_build(build_id)
+        client.close()
+        if ok:
+            self._log(f"🗑 Сборка удалена: {name}")
+            self._refresh_builds()
+        else:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось удалить сборку {name}")
 
     def _save_components(self):
         cfg = self._get_config()
@@ -304,14 +392,14 @@ class DepotTab(QWidget):
         (см. _backend_cfg()), сюда добавляются только компоненты и канал."""
         backend_cfg = self._backend_cfg()
         publish = backend_cfg["publish"]
-        project = backend_cfg["panel"].get("project", "")
+        build_name = backend_cfg["panel"].get("build_name", "")
         return {
             "backend":   backend_cfg["backend"],
             "use_packs": backend_cfg["use_packs"],
             "panel":     backend_cfg["panel"],
             "webdav":    backend_cfg["webdav"],
             "depot": {
-                "app_id":     project or "app",
+                "app_id":     build_name or "app",
                 "depot_id":   1,
                 "channel":    self.channel_combo.currentText(),
                 "chunk_size": publish.get("chunk_size", DEFAULT_CHUNK_SIZE),
@@ -324,8 +412,8 @@ class DepotTab(QWidget):
 
     def _validate_backend(self, cfg: dict) -> str:
         if cfg["backend"] == "panel":
-            if not cfg["panel"].get("base_url") or not cfg["panel"].get("project"):
-                return "Настройте URL панели и проект на странице «⚙️ Настройки»!"
+            if not cfg["panel"].get("base_url") or not cfg["panel"].get("build_id"):
+                return "Настройте URL панели и выберите сборку на странице «🚀 Релизы»!"
         else:
             if not cfg["webdav"].get("server_url"):
                 return "Настройте URL WebDAV сервера на странице «⚙️ Настройки»!"
