@@ -522,12 +522,35 @@ class DepotTab(QWidget):
         self._pending_manifest = new_manifest
         self._pending_delta    = delta
 
-        dlg = DepotConfirmDialog(
-            parent        = self,
-            new_manifest  = new_manifest,
-            delta         = delta,
-            prev_manifest = prev_manifest,
-        )
+        # try/except — тот же живой случай, что в main.py::_install_crash_handler
+        # (2026-09-23, крэш без следа при публикации большой сборки): это
+        # самый новый/непроверенный код на ГЛАВНОМ потоке в этом пути
+        # (сборка диалога подтверждения — DepotConfirmDialog._init_ui()
+        # проходится по спискам новых/изменённых файлов, которых для
+        # первой публикации крупной сборки могут быть сотни тысяч), а
+        # сканирование к этому моменту УЖЕ успешно завершилось (лог
+        # "📊 ..." уже виден) — значит крэш, если он был именно здесь,
+        # выглядел бы для пользователя ровно так: "хэшировалось-хэшировалось
+        # и вдруг пропало", без единой строки в логе. Глобальный
+        # sys.excepthook уже ловит это тоже — но локальный try/except даёт
+        # шанс продолжить работу приложения вместо его закрытия.
+        try:
+            dlg = DepotConfirmDialog(
+                parent        = self,
+                new_manifest  = new_manifest,
+                delta         = delta,
+                prev_manifest = prev_manifest,
+            )
+        except Exception as e:
+            import traceback
+            self._log(f"❌ Не удалось построить диалог подтверждения: {e}\n{traceback.format_exc()}")
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Не удалось построить диалог подтверждения публикации:\n{e}\n\n"
+                "Подробности — в расширенном логе.",
+            )
+            self._on_finished(False, "Ошибка построения диалога подтверждения")
+            return
 
         if dlg.exec() == dlg.DialogCode.Accepted:
             self._start_upload(new_manifest, delta)

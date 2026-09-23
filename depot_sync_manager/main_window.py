@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtCore import pyqtSignal
 
-from config import DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES, get_window_title
+from config import DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES, get_window_title, LOG_FILE
 from chunk_manager import DEFAULT_CHUNK_SIZE
 from pack_writer import DEFAULT_PACK_SIZE
 from file_selector import FileSelector
@@ -648,7 +648,24 @@ class MainWindow(QMainWindow):
     def log_message(self, msg: str):
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
-        self._log_lines.append(f"[{ts}] {msg}")
+        line = f"[{ts}] {msg}"
+        self._log_lines.append(line)
+        # Пишем на диск СРАЗУ (append+flush), не только в память — до этой
+        # правки лог существовал только в _log_lines/log_text и терялся
+        # целиком при любом крэше приложения (единственный способ сохранить
+        # его — кнопка "Сохранить лог", нажать которую после неожиданного
+        # крэша уже не получится). config.LOG_FILE был объявлен, но нигде
+        # не использовался — живой случай (2026-09-23): публикация большой
+        # сборки (Skyrim, хэширование ~170К файлов) уронила приложение без
+        # единого следа, потому что .exe собран с --noconsole --windowed
+        # (см. .github/workflows/build-release.yml) — ни консоли, ни
+        # сохранённого лога не было куда посмотреть. См. также sys.excepthook
+        # в main.py — эта же логика ловит и падения ВНЕ обработанных try/except.
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass  # диск недоступен/только для чтения — не мешаем работе GUI
         # Фильтр применяем и здесь — новая строка сразу учитывает текущий
         # текст фильтра, а не только при следующем его изменении.
         needle = self.log_filter_edit.text().strip().lower()
