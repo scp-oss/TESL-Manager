@@ -346,10 +346,16 @@ class ComponentRow(QWidget):
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(6)
 
-        # Чекбокс
-        self.check = QCheckBox(f"<b>{comp_name}</b>")
+        # Чекбокс — QCheckBox НЕ рендерит HTML (в отличие от QLabel), текст
+        # "<b>...</b>" раньше показывался буквально как теги и обрезался
+        # фиксированной шириной (заметно на длинных именах вроде "MO2ext").
+        # Жирность — через шрифт, ширина — минимальная, не фиксированная.
+        self.check = QCheckBox(comp_name)
+        bold_font = self.check.font()
+        bold_font.setBold(True)
+        self.check.setFont(bold_font)
         self.check.setChecked(comp_cfg.get("included", True))
-        self.check.setFixedWidth(90)
+        self.check.setMinimumWidth(90)
         self.check.stateChanged.connect(self._on_toggle)
         layout.addWidget(self.check)
 
