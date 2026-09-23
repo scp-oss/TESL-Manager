@@ -234,9 +234,7 @@ class ServerFilesTab(QWidget):
         cfg = self.mw.file_selector.config
         if not cfg.get("webdav", {}).get("server_url"):
             QMessageBox.warning(self, "Ошибка", "Настройте WebDAV в настройках!")
-            self.mw.tabs.setCurrentIndex(
-                self.mw.tabs.indexOf(self.mw.tabs.widget(1))  # Настройки
-            )
+            self.mw.show_settings_page()
             return
 
         remote_path = cfg.get("webdav", {}).get("remote_path", "")

@@ -1,33 +1,61 @@
 # ==================== main_window.py ====================
-import os
-import json
-import threading
+"""
+Прямой запрос пользователя (2026-09-23, третий заход по этому GUI):
+интерфейс был "сумбурный" — семь отдельных верхних вкладок вперемешку
+(Релизы/Файлы сервера/Статик-папки/Депо (chunks)/Файлы на депо/
+Настройки/Лог), два разных способа сделать почти одно и то же (старый
+компонентный протокол ReleaseTab и новый chunk-протокол DepotTab, у
+каждого свой набор WebDAV/Panel-полей). Переработано в боковое меню
+из четырёх пунктов:
+
+  🚀 Релизы              — DepotTab (chunk-протокол), компоненты+канал+публикация
+  🗂️ Файлы на сервере    — FilesTab, переключается между WebDAV/Panel-браузерами
+  ⚙️ Настройки            — WebDAV + Panel + backend-выбор + доп. параметры депо,
+                            ЕДИНСТВЕННОЕ место, где это настраивается
+  📝 Лог (расширенный)   — один центральный лог на всё приложение
+
+"Статик-папки" убраны совсем (не нужны, static_folders_tab.py больше не
+подключается). Старая вкладка "Релизы" (release_tab.py::ReleaseTab,
+собственный протокол публикации на WebDAV) тоже больше не подключается —
+её roль теперь играет DepotTab: "депо — это часть релизов, настраивается
+в настройках либо WebDAV, либо токен с панели хранилища" (прямая
+формулировка запроса). Модуль release_tab.py остаётся в репозитории
+только ради класса ComponentRow — им пользуется и DepotTab.
+"""
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QFileDialog,
     QMessageBox, QGroupBox, QLineEdit, QCheckBox,
-    QListWidget, QTabWidget, QFormLayout, QStatusBar,
-    QFrame, QSizePolicy
+    QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QSpinBox,
+    QFormLayout, QStatusBar, QFrame, QInputDialog, QScrollArea,
 )
 from PyQt6.QtGui import QAction, QFont
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 
-from config import (
-    APPDATA_DIR, CONFIG_FILE, DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES,
-    get_window_title,
-)
+from config import DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES, get_window_title
+from chunk_manager import DEFAULT_CHUNK_SIZE
+from pack_writer import DEFAULT_PACK_SIZE
 from file_selector import FileSelector
 from manifest_manager import ManifestManager
 from themes import ThemeManager
 from theme_dialog import ThemeDialog
-from release_tab import ReleaseTab
-from server_files_tab import ServerFilesTab
-from static_folders_tab import StaticFoldersTab
+from depot_tab import DepotTab, CFG_KEY as DEPOT_CFG_KEY
+from files_tab import FilesTab
+
+CHUNK_SIZES = [
+    ("512 KB  — максимальный delta",   512 * 1024),
+    ("1 MB",                           1 * 1024 * 1024),
+    ("4 MB   — рекомендуется",         4 * 1024 * 1024),
+    ("8 MB",                           8 * 1024 * 1024),
+    ("16 MB",                         16 * 1024 * 1024),
+    ("32 MB  — крупные файлы",        32 * 1024 * 1024),
+    ("64 MB  — минимальный overhead", 64 * 1024 * 1024),
+]
 
 
 class StatusBar(QFrame):
-    """Компактная статус-панель"""
+    """Компактная статус-панель."""
 
     folder_change_requested = pyqtSignal()
 
@@ -40,17 +68,17 @@ class StatusBar(QFrame):
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(0)
 
-        # ── WebDAV ────────────────────────────────────────────────────────────
-        dav_info = QVBoxLayout()
-        dav_info.setSpacing(1)
-        lbl_dt = QLabel("WebDAV")
-        lbl_dt.setStyleSheet("font-size: 10px; color: #888;")
-        self.lbl_dav = QLabel("не настроен")
-        self.lbl_dav.setFont(QFont("Segoe UI", 9))
-        self.lbl_dav.setMinimumWidth(260)
-        dav_info.addWidget(lbl_dt)
-        dav_info.addWidget(self.lbl_dav)
-        layout.addLayout(dav_info)
+        # ── Публикация (backend) ─────────────────────────────────────────────
+        pub_info = QVBoxLayout()
+        pub_info.setSpacing(1)
+        lbl_pt = QLabel("Публикация")
+        lbl_pt.setStyleSheet("font-size: 10px; color: #888;")
+        self.lbl_backend = QLabel("не настроено")
+        self.lbl_backend.setFont(QFont("Segoe UI", 9))
+        self.lbl_backend.setMinimumWidth(260)
+        pub_info.addWidget(lbl_pt)
+        pub_info.addWidget(self.lbl_backend)
+        layout.addLayout(pub_info)
 
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.Shape.VLine)
@@ -71,38 +99,31 @@ class StatusBar(QFrame):
         comp_info.addWidget(self.lbl_components)
         layout.addLayout(comp_info)
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setFixedWidth(1)
-        sep2.setStyleSheet("background: #444; margin: 8px 16px;")
-        layout.addSpacing(16)
-        layout.addWidget(sep2)
-        layout.addSpacing(16)
-
-        # ── Манифест ──────────────────────────────────────────────────────────
-        mf_info = QVBoxLayout()
-        mf_info.setSpacing(1)
-        lbl_mft = QLabel("Манифест")
-        lbl_mft.setStyleSheet("font-size: 10px; color: #888;")
-        self.lbl_manifest = QLabel("—")
-        self.lbl_manifest.setFont(QFont("Segoe UI", 9))
-        mf_info.addWidget(lbl_mft)
-        mf_info.addWidget(self.lbl_manifest)
-        layout.addLayout(mf_info)
-
         layout.addStretch()
 
-    def set_webdav(self, url: str, remote_path: str):
-        if url:
-            from urllib.parse import urlparse
-            host = urlparse(url).netloc
-            self.lbl_dav.setText(f"{host} → {remote_path or '/'}")
-            self.lbl_dav.setToolTip(url)
+    def set_backend(self, cfg: dict):
+        backend = cfg.get("backend", "panel")
+        if backend == "panel":
+            panel = cfg.get("panel", {})
+            base_url = panel.get("base_url", "")
+            project  = panel.get("project", "")
+            if base_url and project:
+                from urllib.parse import urlparse
+                host = urlparse(base_url).netloc or base_url
+                self.lbl_backend.setText(f"TESL-Panel: {host} → {project}")
+            else:
+                self.lbl_backend.setText("TESL-Panel: не настроено")
         else:
-            self.lbl_dav.setText("не настроен")
+            webdav = cfg.get("webdav", {})
+            url = webdav.get("server_url", "")
+            if url:
+                from urllib.parse import urlparse
+                host = urlparse(url).netloc
+                self.lbl_backend.setText(f"WebDAV: {host} → {webdav.get('remote_path') or '/'}")
+            else:
+                self.lbl_backend.setText("WebDAV: не настроен")
 
     def set_components(self, components: dict):
-        """Показать какие компоненты настроены."""
         parts = []
         for name in COMPONENT_NAMES:
             c = components.get(name, {})
@@ -111,12 +132,6 @@ class StatusBar(QFrame):
             else:
                 parts.append(f"⚠️ {name}")
         self.lbl_components.setText("  ".join(parts) if parts else "не настроены")
-
-    def set_manifest(self, version: str, file_count: int):
-        if version:
-            self.lbl_manifest.setText(f"{version}  ({file_count} файлов)")
-        else:
-            self.lbl_manifest.setText("—")
 
 
 class MainWindow(QMainWindow):
@@ -130,11 +145,41 @@ class MainWindow(QMainWindow):
         self.file_selector    = FileSelector(self)
         self.config           = self.file_selector.config
         self.manifest_manager = ManifestManager(self.config)
+        self._log_lines       = []   # полная (нефильтрованная) история лога, см. _build_log_tab()
+        self._migrate_legacy_backend_config()
 
         self._create_ui()
         self.theme_manager.apply_theme(self)
         self._connect_signals()
         self._load_initial_data()
+
+    # ── Migration: старые cfg["depot_tab"]["panel"/"webdav"/"depot"] → общие
+    #    cfg["panel"]/cfg["backend"]/cfg["depot_publish"] (введены этим
+    #    заходом) — только если новых ключей ещё нет, ничего не трогает у
+    #    того, кто уже сохранил конфиг в новом виде. ────────────────────────────
+
+    def _migrate_legacy_backend_config(self):
+        cfg = self.config
+        old = cfg.get("depot_tab", {})
+        if not old:
+            return
+        if "backend" not in cfg and old.get("backend"):
+            cfg["backend"] = old["backend"]
+        if "panel" not in cfg and old.get("panel", {}).get("base_url"):
+            cfg["panel"] = old["panel"]
+        if not cfg.get("webdav", {}).get("server_url") and old.get("webdav", {}).get("server_url"):
+            cfg["webdav"] = old["webdav"]
+        if "depot_publish" not in cfg:
+            d = old.get("depot", {})
+            cfg["depot_publish"] = {
+                "use_packs":  old.get("use_packs", True),
+                "chunk_size": d.get("chunk_size", DEFAULT_CHUNK_SIZE),
+                "pack_size":  d.get("pack_size", DEFAULT_PACK_SIZE),
+            }
+        # Больше не сохраняем backend/panel/depot внутри depot_tab — только
+        # components/channel там теперь и нужны (см. depot_tab.py).
+        for stale_key in ("backend", "panel", "webdav", "depot", "use_packs"):
+            old.pop(stale_key, None)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -150,45 +195,49 @@ class MainWindow(QMainWindow):
         self.status_panel = StatusBar()
         root.addWidget(self.status_panel)
 
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs)
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(8)
 
-        self.release_tab = ReleaseTab(self)
-        self.release_tab.log_message.connect(self.log_message)
-        self.tabs.addTab(self.release_tab, "🏷️ Релизы")
+        self.nav_list = QListWidget()
+        self.nav_list.setFixedWidth(190)
+        self.nav_list.setSpacing(2)
+        self.nav_list.currentRowChanged.connect(self._on_nav_changed)
+        body_layout.addWidget(self.nav_list)
 
-        self.server_files_tab = ServerFilesTab(self)
-        self.server_files_tab.log_message.connect(self.log_message)
-        self.tabs.addTab(self.server_files_tab, "🗂️ Файлы сервера")
+        self.pages = QStackedWidget()
+        body_layout.addWidget(self.pages, stretch=1)
 
-        self.static_tab = StaticFoldersTab(self)
-        self.static_tab.log_message.connect(self.log_message)
-        self.tabs.addTab(self.static_tab, "📦 Статик-папки")
+        root.addWidget(body, stretch=1)
 
-        # Chunk-based депо (TESL-Panel/WebDAV, опционально с упаковкой чанков
-        # в pack-файлы) — независимый от ReleaseTab протокол публикации, см.
-        # depot_tab.py и CLAUDE.md "Упаковка чанков в pack-файлы".
-        from depot_tab import DepotTab
         self.depot_tab = DepotTab(self)
         self.depot_tab.log_message.connect(self.log_message)
-        self.tabs.addTab(self.depot_tab, "📦 Депо (chunks)")
+        self._add_page("🚀 Релизы", self.depot_tab)
 
-        # Отдельная вкладка для просмотра/редактирования/добавления уже
-        # опубликованных на TESL-Panel файлов (Bearer, см. её собственный
-        # CLAUDE.md /api/projects, /api/depot/<project>/files) — десктоп-
-        # эквивалент панельского /admin/project/<name>/files, независимый
-        # от sever_files_tab.py (тот — для WebDAV/PROPFIND).
-        from depot_files_tab import DepotFilesTab
-        self.depot_files_tab = DepotFilesTab(self)
-        self.depot_files_tab.log_message.connect(self.log_message)
-        self.tabs.addTab(self.depot_files_tab, "🗂️ Файлы на депо")
+        self.files_tab = FilesTab(self)
+        self.files_tab.log_message.connect(self.log_message)
+        self._add_page("🗂️ Файлы на сервере", self.files_tab)
 
-        self.tabs.addTab(self._build_settings_tab(), "⚙️ Настройки")
-        self.tabs.addTab(self._build_log_tab(), "📝 Лог")
+        self.settings_page_index = self._add_page("⚙️ Настройки", self._build_settings_tab())
+        self._add_page("📝 Лог (расширенный)", self._build_log_tab())
+
+        self.nav_list.setCurrentRow(0)
 
         self.sb = QStatusBar()
         self.setStatusBar(self.sb)
         self.sb.showMessage("Готов")
+
+    def _add_page(self, label: str, widget: QWidget) -> int:
+        self.nav_list.addItem(QListWidgetItem(label))
+        return self.pages.addWidget(widget)
+
+    def _on_nav_changed(self, row: int):
+        if row >= 0:
+            self.pages.setCurrentIndex(row)
+
+    def show_settings_page(self):
+        self.nav_list.setCurrentRow(self.settings_page_index)
 
     # ── Menu ──────────────────────────────────────────────────────────────────
 
@@ -205,8 +254,8 @@ class MainWindow(QMainWindow):
         a3 = QAction("Проверить соединение", self)
         a3.triggered.connect(self._test_connection)
         sm.addAction(a3)
-        a4 = QAction("Обновить список версий", self)
-        a4.triggered.connect(lambda: self.release_tab._refresh_index())
+        a4 = QAction("Обновить инфо о сборке", self)
+        a4.triggered.connect(lambda: self.depot_tab._fetch_server_info())
         sm.addAction(a4)
 
         stm = mb.addMenu("⚙️ Настройки")
@@ -214,15 +263,62 @@ class MainWindow(QMainWindow):
         a5.triggered.connect(self.show_theme_dialog)
         stm.addAction(a5)
 
-    # ── Settings tab ──────────────────────────────────────────────────────────
+    # ── Settings page ────────────────────────────────────────────────────────
+    # Единственное место в приложении, где настраивается: куда публиковать
+    # (WebDAV/Panel), сами реквизиты обоих, и параметры депо (chunk size/
+    # упаковка в pack-файлы) — прямой запрос пользователя ("депо — это
+    # часть релизов, настраивается в настройках"). "Релизы" (DepotTab) и
+    # "Файлы на сервере" (FilesTab) только ЧИТАЮТ эти ключи конфига.
 
     def _build_settings_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setSpacing(10)
 
-        # WebDAV
-        wbox = QGroupBox("Подключение WebDAV")
+        # ── Куда публиковать ─────────────────────────────────────────────────
+        backend_box = QGroupBox("Куда публиковать")
+        backend_layout = QVBoxLayout(backend_box)
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItems([
+            "TESL-Panel (напрямую, минуя Nextcloud)",
+            "WebDAV (Nextcloud)",
+        ])
+        self.backend_combo.currentIndexChanged.connect(self._save_backend_choice)
+        backend_layout.addWidget(self.backend_combo)
+        layout.addWidget(backend_box)
+
+        # ── TESL-Panel ────────────────────────────────────────────────────────
+        panel_box = QGroupBox("TESL-Panel")
+        panel_form = QFormLayout(panel_box)
+        self.panel_url_edit = QLineEdit()
+        self.panel_url_edit.setPlaceholderText("https://tesl-panel.neth.de5.net")
+        panel_form.addRow("URL панели:", self.panel_url_edit)
+
+        proj_row = QHBoxLayout()
+        self.panel_project_combo = QComboBox()
+        self.panel_project_combo.setMinimumWidth(160)
+        proj_row.addWidget(self.panel_project_combo, stretch=1)
+        btn_refresh_proj = QPushButton("🔄")
+        btn_refresh_proj.setFixedWidth(32)
+        btn_refresh_proj.setToolTip("Обновить список проектов с сервера")
+        btn_refresh_proj.clicked.connect(self._refresh_panel_projects)
+        proj_row.addWidget(btn_refresh_proj)
+        btn_new_proj = QPushButton("➕ Новый")
+        btn_new_proj.clicked.connect(self._create_new_panel_project)
+        proj_row.addWidget(btn_new_proj)
+        panel_form.addRow("Проект:", proj_row)
+
+        self.panel_token_edit = QLineEdit()
+        self.panel_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        panel_form.addRow("Upload-токен:", self.panel_token_edit)
+
+        btn_save_panel = QPushButton("💾 Сохранить")
+        btn_save_panel.clicked.connect(self._save_panel_settings)
+        panel_form.addRow("", btn_save_panel)
+        layout.addWidget(panel_box)
+
+        # ── WebDAV ────────────────────────────────────────────────────────────
+        wbox = QGroupBox("WebDAV (Nextcloud)")
         form = QFormLayout(wbox)
         form.setSpacing(8)
 
@@ -254,23 +350,69 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(wbox)
 
-        # Hint
+        # ── Дополнительно (депо) ─────────────────────────────────────────────
+        adv_box = QGroupBox("Дополнительно (депо)")
+        adv_form = QFormLayout(adv_box)
+
+        self.chunk_combo = QComboBox()
+        for label, _ in CHUNK_SIZES:
+            self.chunk_combo.addItem(label)
+        adv_form.addRow("Размер чанка:", self.chunk_combo)
+
+        self.use_packs_check = QCheckBox(
+            "Упаковывать чанки в pack-файлы (меньше отдельных файлов на диске сервера)"
+        )
+        self.use_packs_check.stateChanged.connect(
+            lambda _: self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
+        )
+        adv_form.addRow("", self.use_packs_check)
+
+        self.pack_size_spin = QSpinBox()
+        self.pack_size_spin.setRange(16, 4096)
+        self.pack_size_spin.setSuffix(" MB")
+        adv_form.addRow("Размер pack-файла:", self.pack_size_spin)
+
+        btn_save_adv = QPushButton("💾 Сохранить")
+        btn_save_adv.clicked.connect(self._save_advanced_settings)
+        adv_form.addRow("", btn_save_adv)
+
+        layout.addWidget(adv_box)
+
         hint = QLabel(
-            "💡 Пути к компонентам (Skyrim, MO2p, MO2ext) и их исключения\n"
-            "настраиваются на вкладке «Релизы» → блок «Компоненты сборки»."
+            "💡 Компоненты сборки (Skyrim/MO2p/MO2ext) и канал (stable/beta/dev) "
+            "настраиваются на странице «🚀 Релизы»."
         )
         hint.setStyleSheet("color: #888; font-size: 9pt; padding: 4px;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         layout.addStretch()
-        return tab
 
-    # ── Log tab ───────────────────────────────────────────────────────────────
+        # Настроек здесь накопилось на больше одного экрана (куда
+        # публиковать + Panel + WebDAV + доп. параметры депо) — без
+        # прокрутки нижние блоки (WebDAV) визуально сжимались/налезали
+        # друг на друга на обычной высоте окна, ровно то, на что жаловался
+        # пользователь ("почини скукуренные строки"). QScrollArea вместо
+        # попытки уместить всё без прокрутки.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(tab)
+        return scroll
+
+    # ── Log page — единый центральный лог ────────────────────────────────────
 
     def _build_log_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Фильтр:"))
+        self.log_filter_edit = QLineEdit()
+        self.log_filter_edit.setPlaceholderText("Показывать только строки, содержащие…")
+        self.log_filter_edit.textChanged.connect(self._apply_log_filter)
+        filter_row.addWidget(self.log_filter_edit)
+        layout.addLayout(filter_row)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -281,7 +423,7 @@ class MainWindow(QMainWindow):
         btn_save  = QPushButton("💾 Сохранить")
         btn_clear.setFixedHeight(30)
         btn_save.setFixedHeight(30)
-        btn_clear.clicked.connect(self.log_text.clear)
+        btn_clear.clicked.connect(self._clear_log)
         btn_save.clicked.connect(self._save_log)
         btn_row.addWidget(btn_clear)
         btn_row.addWidget(btn_save)
@@ -290,6 +432,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_text)
         layout.addLayout(btn_row)
         return tab
+
+    def _apply_log_filter(self, _needle: str):
+        self._refresh_log_display()
+
+    def _refresh_log_display(self):
+        needle = self.log_filter_edit.text().strip().lower()
+        lines = self._log_lines if not needle else [
+            l for l in self._log_lines if needle in l.lower()
+        ]
+        self.log_text.setPlainText("\n".join(lines))
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+
+    def _clear_log(self):
+        self._log_lines = []
+        self.log_text.clear()
 
     # ── Signals ───────────────────────────────────────────────────────────────
 
@@ -303,13 +462,27 @@ class MainWindow(QMainWindow):
     def _load_initial_data(self):
         cfg = self.file_selector.config
 
-        # Инициализируем компоненты в конфиге если их нет
         if "components" not in cfg:
             cfg["components"] = {}
         for name in COMPONENT_NAMES:
             if name not in cfg["components"]:
                 cfg["components"][name] = dict(DEFAULT_COMPONENTS_CONFIG[name])
 
+        # Backend choice
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.setCurrentIndex(0 if cfg.get("backend", "panel") == "panel" else 1)
+        self.backend_combo.blockSignals(False)
+
+        # Panel
+        panel = cfg.get("panel", {})
+        self.panel_url_edit.setText(panel.get("base_url", ""))
+        self.panel_token_edit.setText(panel.get("token", ""))
+        saved_project = panel.get("project", "")
+        if saved_project:
+            self.panel_project_combo.addItem(saved_project)
+            self.panel_project_combo.setCurrentIndex(0)
+
+        # WebDAV
         webdav = self.file_selector.get_webdav_config()
         if webdav.get("server_url"):
             self.webdav_url_edit.setText(webdav.get("server_url", ""))
@@ -317,24 +490,92 @@ class MainWindow(QMainWindow):
             self.webdav_password_edit.setText(webdav.get("password", ""))
             self.webdav_path_edit.setText(webdav.get("remote_path", ""))
             self.webdav_ssl_check.setChecked(webdav.get("verify_ssl", True))
-            self.status_panel.set_webdav(
-                webdav.get("server_url", ""),
-                webdav.get("remote_path", ""),
-            )
 
-        self.status_panel.set_components(cfg.get("components", {}))
+        # Advanced / depot publish
+        publish = cfg.get("depot_publish", {})
+        self.use_packs_check.setChecked(publish.get("use_packs", True))
+        self.pack_size_spin.setValue(publish.get("pack_size", DEFAULT_PACK_SIZE) // 1024 // 1024)
+        self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
+        target_size = publish.get("chunk_size", DEFAULT_CHUNK_SIZE)
+        for i, (_, size) in enumerate(CHUNK_SIZES):
+            if size == target_size:
+                self.chunk_combo.setCurrentIndex(i)
+                break
 
-        # Читаем manifest.json для статус-панели
-        mf = APPDATA_DIR / "manifest.json"
-        if mf.exists():
-            try:
-                data = json.loads(mf.read_text(encoding="utf-8"))
-                files   = data.get("files", {})
-                version = data.get("version", data.get("build_id", "—"))
-                self.status_panel.set_manifest(version, len(files))
-                self.log_message(f"📄 Манифест: {version}, {len(files)} файлов")
-            except Exception:
-                pass
+        self.status_panel.set_backend(cfg)
+        self.status_panel.set_components(cfg.get(DEPOT_CFG_KEY, {}).get("components", {}))
+
+    # ── Backend settings handlers ────────────────────────────────────────────
+
+    def _save_backend_choice(self, _idx: int = 0):
+        cfg = self.config
+        cfg["backend"] = "panel" if self.backend_combo.currentIndex() == 0 else "webdav"
+        self.file_selector.save_config()
+        self.status_panel.set_backend(cfg)
+        self.log_message(f"✅ Backend публикации: {cfg['backend']}")
+
+    def _refresh_panel_projects(self):
+        base_url = self.panel_url_edit.text().strip().rstrip("/")
+        if not base_url:
+            QMessageBox.warning(self, "Ошибка", "Заполните URL панели!")
+            return
+        from panel_client import PanelHTTP
+        client = PanelHTTP(base_url=base_url, project="", token=self.panel_token_edit.text())
+        names = client.list_projects()
+        client.close()
+        current = self.panel_project_combo.currentText()
+        self.panel_project_combo.clear()
+        self.panel_project_combo.addItems(names)
+        if current:
+            idx = self.panel_project_combo.findText(current)
+            if idx >= 0:
+                self.panel_project_combo.setCurrentIndex(idx)
+        self.log_message(f"📋 Проектов на панели: {len(names)}")
+
+    def _create_new_panel_project(self):
+        base_url = self.panel_url_edit.text().strip().rstrip("/")
+        token = self.panel_token_edit.text()
+        if not base_url or not token:
+            QMessageBox.warning(self, "Ошибка", "Заполните URL панели и upload-токен!")
+            return
+        name, ok = QInputDialog.getText(self, "Новый проект", "Имя проекта (буквы/цифры/_/-):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        from panel_client import PanelHTTP
+        client = PanelHTTP(base_url=base_url, project="", token=token)
+        created, msg = client.create_project(name)
+        client.close()
+        if created:
+            self.log_message(f"✅ Проект создан: {name}")
+            self._refresh_panel_projects()
+            idx = self.panel_project_combo.findText(name)
+            if idx >= 0:
+                self.panel_project_combo.setCurrentIndex(idx)
+        else:
+            QMessageBox.warning(self, "Ошибка", msg)
+
+    def _save_panel_settings(self):
+        cfg = self.config
+        cfg["panel"] = {
+            "base_url":   self.panel_url_edit.text().strip().rstrip("/"),
+            "project":    self.panel_project_combo.currentText().strip(),
+            "token":      self.panel_token_edit.text(),
+            "verify_ssl": True,
+        }
+        self.file_selector.save_config()
+        self.status_panel.set_backend(cfg)
+        self.log_message("✅ Настройки TESL-Panel сохранены")
+
+    def _save_advanced_settings(self):
+        cfg = self.config
+        cfg["depot_publish"] = {
+            "use_packs":  self.use_packs_check.isChecked(),
+            "chunk_size": CHUNK_SIZES[self.chunk_combo.currentIndex()][1],
+            "pack_size":  self.pack_size_spin.value() * 1024 * 1024,
+        }
+        self.file_selector.save_config()
+        self.log_message("✅ Дополнительные настройки депо сохранены")
 
     # ── WebDAV ────────────────────────────────────────────────────────────────
 
@@ -354,7 +595,7 @@ class MainWindow(QMainWindow):
 
         ok = self.file_selector.set_webdav_config(url, username, password, path, ssl)
         if ok:
-            self.status_panel.set_webdav(url, path)
+            self.status_panel.set_backend(self.config)
             self.log_message("✅ Настройки WebDAV сохранены")
             QMessageBox.information(self, "Сохранено", "Настройки WebDAV сохранены!")
         else:
@@ -362,46 +603,37 @@ class MainWindow(QMainWindow):
 
     def _test_connection(self):
         cfg = self.file_selector.config
-        if not cfg.get("webdav", {}).get("server_url"):
+        backend = cfg.get("backend", "panel")
+        if backend == "webdav" and not cfg.get("webdav", {}).get("server_url"):
             QMessageBox.warning(self, "Ошибка", "Сначала настройте WebDAV!")
-            self.tabs.setCurrentIndex(3)
+            self.show_settings_page()
             return
-        self.log_message("🔌 Проверяем соединение…")
-        self.sb.showMessage("Проверка соединения…")
-        from depot_sync_manager import NextcloudDAV
-        w = cfg.get("webdav", {})
-        dav = NextcloudDAV(
-            w.get("server_url", ""),
-            w.get("username", ""),
-            w.get("password", ""),
-            w.get("verify_ssl", True),
-        )
-        ok, msg = dav.test_connection()
-        dav.close()
-        if ok:
-            self.log_message(f"✅ {msg}")
-            self.sb.showMessage(f"✅ {msg}")
-            QMessageBox.information(self, "Соединение", f"✅ {msg}")
-        else:
-            self.log_message(f"❌ {msg}")
-            self.sb.showMessage("❌ Ошибка соединения")
-            QMessageBox.warning(self, "Ошибка соединения", msg)
+        if backend == "panel" and not cfg.get("panel", {}).get("base_url"):
+            QMessageBox.warning(self, "Ошибка", "Сначала настройте TESL-Panel!")
+            self.show_settings_page()
+            return
+        self.depot_tab._test_connection()
 
     # ── Config updated ────────────────────────────────────────────────────────
 
     def _on_config_updated(self, config: dict):
-        # Обновляем статус-панель компонентов
-        self.status_panel.set_components(config.get("components", {}))
+        self.status_panel.set_backend(config)
+        self.status_panel.set_components(config.get(DEPOT_CFG_KEY, {}).get("components", {}))
 
     # ── Log ───────────────────────────────────────────────────────────────────
 
     def log_message(self, msg: str):
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.append(f"[{ts}] {msg}")
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
+        self._log_lines.append(f"[{ts}] {msg}")
+        # Фильтр применяем и здесь — новая строка сразу учитывает текущий
+        # текст фильтра, а не только при следующем его изменении.
+        needle = self.log_filter_edit.text().strip().lower()
+        if not needle or needle in self._log_lines[-1].lower():
+            self.log_text.append(self._log_lines[-1])
+            self.log_text.verticalScrollBar().setValue(
+                self.log_text.verticalScrollBar().maximum()
+            )
 
     def _save_log(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -411,7 +643,7 @@ class MainWindow(QMainWindow):
         )
         if path:
             try:
-                Path(path).write_text(self.log_text.toPlainText(), encoding="utf-8")
+                Path(path).write_text("\n".join(self._log_lines), encoding="utf-8")
                 self.log_message(f"✅ Лог → {path}")
             except Exception as e:
                 QMessageBox.critical(self, "Ошибка", str(e))

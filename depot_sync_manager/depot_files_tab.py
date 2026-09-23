@@ -1,11 +1,15 @@
 # ==================== depot_files_tab.py ====================
 """
-Вкладка "🗂️ Файлы на депо" — просмотр/редактирование/добавление уже
-опубликованных файлов на TESL-Panel (см. scp-oss/TESL-Panel), десктоп-
-эквивалент её же /admin/project/<name>/files (файловый менеджер в
-браузере) — тот же Bearer-токен, что и публикация из "📦 Депо (chunks)"
-(DepotTab), настройки соединения (URL/токен) переиспользуются оттуда же
-(cfg[depot_tab]["panel"]) — здесь настраивается только сам проект.
+Часть страницы "🗂️ Файлы на сервере" (см. files_tab.py) — просмотр/
+редактирование/добавление уже опубликованных файлов на TESL-Panel (см.
+scp-oss/TESL-Panel), десктоп-эквивалент её же
+/admin/project/<name>/files (файловый менеджер в браузере) — тот же
+Bearer-токен, что и публикация из "🚀 Релизы". Настройки соединения
+(URL/токен) читаются из общего cfg["panel"] (настраивается на странице
+"⚙️ Настройки", единожды на всё приложение) — здесь настраивается
+только КАКОЙ проект просматривать (свой отдельный выбор, не обязательно
+совпадающий с текущим проектом публикации — админ может смотреть файлы
+любого проекта).
 
 Только для backend="panel" — у WebDAV уже есть своя вкладка "🗂️ Файлы
 сервера" (server_files_tab.py, PROPFIND-дерево), эта — параллельный
@@ -28,10 +32,6 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QFont
 
 MAX_INLINE_EDIT_BYTES = 256 * 1024
-
-# Ключ конфига DepotTab (depot_tab.py::CFG_KEY) — соединение с панелью
-# настраивается там один раз, эта вкладка только читает panel{}.
-DEPOT_CFG_KEY = "depot_tab"
 
 
 def _fmt_size(n: int) -> str:
@@ -175,7 +175,7 @@ class DepotFilesTab(QWidget):
         conn_row.addWidget(btn_refresh_projects)
 
         conn_row.addStretch()
-        hint = QLabel("Соединение (URL панели / токен) берётся с вкладки «📦 Депо (chunks)»")
+        hint = QLabel("Соединение (URL панели / токен) настраивается на странице «⚙️ Настройки»")
         hint.setStyleSheet("color: #888; font-size: 9pt;")
         conn_row.addWidget(hint)
         root.addWidget(conn_box)
@@ -228,7 +228,7 @@ class DepotFilesTab(QWidget):
     # ── Client / config helpers ─────────────────────────────────────────────
 
     def _panel_cfg(self) -> dict:
-        return self.mw.file_selector.config.get(DEPOT_CFG_KEY, {}).get("panel", {})
+        return self.mw.file_selector.config.get("panel", {})
 
     def _make_client(self, project: str):
         from panel_client import PanelHTTP
@@ -251,7 +251,7 @@ class DepotFilesTab(QWidget):
         cfg = self._panel_cfg()
         if not cfg.get("base_url"):
             self.status_label.setText(
-                "⚠️ Сначала настройте URL панели/токен на вкладке «📦 Депо (chunks)»"
+                "⚠️ Сначала настройте URL панели/токен на странице «⚙️ Настройки»"
             )
             return
         client = self._make_client("")
@@ -277,7 +277,7 @@ class DepotFilesTab(QWidget):
         if not cfg.get("base_url") or not cfg.get("token"):
             QMessageBox.warning(
                 self, "Ошибка",
-                "Настройте URL панели и upload-токен на вкладке «📦 Депо (chunks)»",
+                "Настройте URL панели и upload-токен на странице «⚙️ Настройки»",
             )
             return
 
@@ -351,7 +351,7 @@ class DepotFilesTab(QWidget):
         default_rel = Path(local_path).name
         rel_path = default_rel  # простая схема — кладём в корень проекта,
         # для произвольного пути внутри дерева переименуйте/переместите
-        # локально перед выбором либо используйте «📦 Депо (chunks)» для
+        # локально перед выбором либо используйте «🚀 Релизы» для
         # обычной публикации сборки — эта кнопка для отдельных файлов
         # (readme, poster.png и т.п.), не для чанков.
 
