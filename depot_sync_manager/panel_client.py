@@ -1,0 +1,151 @@
+# ==================== panel_client.py ====================
+"""
+PanelHTTP — транспорт для публикации депо напрямую в TESL-Panel (см.
+scp-oss/TESL-Panel), минуя Nextcloud/WebDAV. Реализует ТОТ ЖЕ публичный
+интерфейс, что и NextcloudDAV в depot_sync_manager.py (exists/mkcol/put/
+put_file/get_bytes/list_chunk_ids/test_connection/close) — DepotSyncManager
+конструирует один или другой в зависимости от config["backend"]
+("webdav" | "panel"), сам код execute_sync()/ensure_depot_structure() не
+меняется ни на строчку, см. CLAUDE.md "Публикация напрямую в наш сервис".
+
+mkcol() здесь — no-op (всегда True): панель создаёт родительские папки
+сама при первом PUT в них, отдельного MKCOL-запроса не нужно — но метод
+оставлен с той же сигнатурой, чтобы вызывающий код (`ensure_depot_structure`,
+`_ensure_chunk_subdir`) не знал и не заботился, какой транспорт активен.
+"""
+import time
+from typing import Optional, Set, Tuple
+
+import requests
+
+
+TIMEOUT_CONNECT = 15
+TIMEOUT_PUT     = 120
+TIMEOUT_GET     = 60
+
+MAX_RETRIES   = 3
+RETRY_BACKOFF = (1, 3, 7)
+
+
+class PanelHTTP:
+    def __init__(
+        self,
+        base_url:   str,
+        project:    str,
+        token:      str,
+        verify_ssl: bool = True,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.project  = project
+        self.session  = requests.Session()
+        self.session.verify = verify_ssl
+        self.session.headers.update({
+            "User-Agent":    "Uploder-Panel/1.0",
+            "Authorization": f"Bearer {token}",
+        })
+        self.last_response = None
+
+    def _url(self, rel_path: str) -> str:
+        return f"{self.base_url}/api/depot/{self.project}/{rel_path.strip('/')}"
+
+    def _retry(self, fn, *args, **kwargs):
+        last_exc = None
+        for attempt, delay in enumerate(RETRY_BACKOFF[:MAX_RETRIES]):
+            try:
+                return fn(*args, **kwargs)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                last_exc = e
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(delay)
+        raise last_exc
+
+    # ── Интерфейс, совместимый с NextcloudDAV ────────────────────────────────
+
+    def exists(self, path: str) -> bool:
+        try:
+            r = self._retry(self.session.head, self._url(path), timeout=TIMEOUT_CONNECT)
+            self.last_response = r
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def mkcol(self, path: str) -> bool:
+        # См. докстринг модуля — панель создаёт директории сама при PUT.
+        return True
+
+    def put(self, path: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+        try:
+            r = self._retry(
+                self.session.put, self._url(path), data=data,
+                headers={"Content-Type": content_type}, timeout=TIMEOUT_PUT,
+            )
+            self.last_response = r
+            return r.status_code in (200, 201, 204)
+        except Exception:
+            return False
+
+    def put_file(self, path: str, local_path, content_type: str = "application/octet-stream") -> bool:
+        try:
+            with open(local_path, "rb") as f:
+                r = self._retry(
+                    self.session.put, self._url(path), data=f,
+                    headers={"Content-Type": content_type}, timeout=TIMEOUT_PUT,
+                )
+            self.last_response = r
+            return r.status_code in (200, 201, 204)
+        except Exception:
+            return False
+
+    def get_bytes(self, path: str) -> Optional[bytes]:
+        try:
+            r = self._retry(self.session.get, self._url(path), timeout=TIMEOUT_GET)
+            self.last_response = r
+            return r.content if r.status_code == 200 else None
+        except Exception:
+            return None
+
+    def list_chunk_ids(self, chunks_path: str = "") -> Set[str]:
+        # chunks_path игнорируется — на панели один project = одна папка
+        # chunks/, отдельный listing-эндпоинт уже знает, где искать (см.
+        # TESL-Panel::panel/app.py depot_list_chunks).
+        try:
+            r = self._retry(
+                self.session.get,
+                f"{self.base_url}/api/depot/{self.project}/chunks",
+                timeout=TIMEOUT_GET,
+            )
+            self.last_response = r
+            if r.status_code != 200:
+                return set()
+            return set(r.json().get("chunk_ids", []))
+        except Exception:
+            return set()
+
+    def test_connection(self) -> Tuple[bool, str]:
+        try:
+            r = self.session.get(
+                f"{self.base_url}/api/depot/{self.project}/test",
+                timeout=TIMEOUT_CONNECT,
+            )
+            self.last_response = r
+            if r.status_code == 200:
+                return True, "Подключено (TESL-Panel)"
+            if r.status_code == 401:
+                return False, "Неверный upload-токен"
+            if r.status_code == 404:
+                return False, f"Неизвестный project на панели: {self.project}"
+            if r.status_code == 503:
+                return False, "Панель не сконфигурирована для приёма публикаций (нет upload-токена на сервере)"
+            return False, f"HTTP {r.status_code}"
+        except requests.exceptions.SSLError as e:
+            return False, f"SSL ошибка: {e}"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Нет соединения: {e}"
+        except requests.exceptions.Timeout:
+            return False, f"Таймаут подключения ({TIMEOUT_CONNECT}s)"
+        except Exception as e:
+            return False, str(e)
+
+    def close(self):
+        self.session.close()

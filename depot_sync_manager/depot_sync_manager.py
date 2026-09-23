@@ -382,18 +382,36 @@ class DepotSyncManager(QObject):
         super().__init__()
         self.config      = config
         self.webdav_cfg  = config.get("webdav", {})
+        self.panel_cfg   = config.get("panel", {})
+        # "webdav" (по умолчанию, без изменений) | "panel" — публикация
+        # напрямую в TESL-Panel вместо Nextcloud, см. panel_client.py и
+        # CLAUDE.md "Публикация напрямую в наш сервис". Ничего ниже в этом
+        # классе не знает, какой бэкенд активен — оба транспорта реализуют
+        # один и тот же интерфейс (exists/mkcol/put/put_file/get_bytes/
+        # list_chunk_ids/test_connection/close).
+        self.backend     = config.get("backend", "webdav")
         self.remote_path = self.webdav_cfg.get("remote_path", "").strip("/")
-        self._dav: Optional[NextcloudDAV] = None
+        self._dav = None   # NextcloudDAV | PanelHTTP, в зависимости от self.backend
 
-    def _get_dav(self) -> NextcloudDAV:
+    def _get_dav(self):
         if self._dav is None:
-            cfg = self.webdav_cfg
-            self._dav = NextcloudDAV(
-                server_url = cfg.get("server_url", ""),
-                username   = cfg.get("username", ""),
-                password   = cfg.get("password", ""),
-                verify_ssl = cfg.get("verify_ssl", True),
-            )
+            if self.backend == "panel":
+                from panel_client import PanelHTTP
+                cfg = self.panel_cfg
+                self._dav = PanelHTTP(
+                    base_url   = cfg.get("base_url", ""),
+                    project    = cfg.get("project", ""),
+                    token      = cfg.get("token", ""),
+                    verify_ssl = cfg.get("verify_ssl", True),
+                )
+            else:
+                cfg = self.webdav_cfg
+                self._dav = NextcloudDAV(
+                    server_url = cfg.get("server_url", ""),
+                    username   = cfg.get("username", ""),
+                    password   = cfg.get("password", ""),
+                    verify_ssl = cfg.get("verify_ssl", True),
+                )
         return self._dav
 
     def test_connection(self) -> Tuple[bool, str]:
