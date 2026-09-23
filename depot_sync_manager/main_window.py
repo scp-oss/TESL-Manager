@@ -27,11 +27,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QFileDialog,
     QMessageBox, QGroupBox, QLineEdit, QCheckBox,
-    QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QSpinBox,
+    QListWidget, QListWidgetItem, QStackedWidget, QComboBox,
     QFormLayout, QStatusBar, QFrame, QScrollArea,
 )
-from PyQt6.QtGui import QAction, QFont
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QFont
+from PyQt6.QtCore import pyqtSignal, QTimer
 
 from config import DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES, get_window_title, LOG_FILE
 from chunk_manager import DEFAULT_CHUNK_SIZE
@@ -42,16 +42,6 @@ from themes import ThemeManager
 from theme_dialog import ThemeDialog
 from depot_tab import DepotTab, CFG_KEY as DEPOT_CFG_KEY
 from files_tab import FilesTab
-
-CHUNK_SIZES = [
-    ("512 KB  — максимальный delta",   512 * 1024),
-    ("1 MB",                           1 * 1024 * 1024),
-    ("4 MB   — рекомендуется",         4 * 1024 * 1024),
-    ("8 MB",                           8 * 1024 * 1024),
-    ("16 MB",                         16 * 1024 * 1024),
-    ("32 MB  — крупные файлы",        32 * 1024 * 1024),
-    ("64 MB  — минимальный overhead", 64 * 1024 * 1024),
-]
 
 
 class StatusBar(QFrame):
@@ -148,10 +138,23 @@ class MainWindow(QMainWindow):
         self._log_lines       = []   # полная (нефильтрованная) история лога, см. _build_log_tab()
         self._migrate_legacy_backend_config()
 
+        # Дебаг-режим (2026-09-23, прямой запрос) — один timestamp на весь
+        # сеанс работы приложения: периодическая отправка лога в панель
+        # переиспользует ОДНУ и ту же запись отчёта (перезаписывает файл
+        # каждый раз, см. debug_reporter.upload_report()/reports_storage.
+        # put_file() на панели — плоская перезапись, не история версий),
+        # а не плодит новую запись на каждый тик таймера.
+        from datetime import datetime as _dt
+        self._debug_session_ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        self._debug_timer = QTimer(self)
+        self._debug_timer.setInterval(5 * 60 * 1000)  # 5 минут
+        self._debug_timer.timeout.connect(self._upload_debug_log)
+
         self._create_ui()
         self.theme_manager.apply_theme(self)
         self._connect_signals()
         self._load_initial_data()
+        self._apply_debug_mode_state()
 
     # ── Migration: старые cfg["depot_tab"]["panel"/"webdav"/"depot"] → общие
     #    cfg["panel"]/cfg["backend"]/cfg["depot_publish"] (введены этим
@@ -210,8 +213,6 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        self._create_menu()
-
         self.status_panel = StatusBar()
         root.addWidget(self.status_panel)
 
@@ -258,30 +259,6 @@ class MainWindow(QMainWindow):
 
     def show_settings_page(self):
         self.nav_list.setCurrentRow(self.settings_page_index)
-
-    # ── Menu ──────────────────────────────────────────────────────────────────
-
-    def _create_menu(self):
-        mb = self.menuBar()
-
-        fm = mb.addMenu("📁 Файл")
-        a2 = QAction("Выход", self)
-        a2.setShortcut("Ctrl+Q")
-        a2.triggered.connect(self.close)
-        fm.addAction(a2)
-
-        sm = mb.addMenu("🌐 Сервер")
-        a3 = QAction("Проверить соединение", self)
-        a3.triggered.connect(self._test_connection)
-        sm.addAction(a3)
-        a4 = QAction("Обновить инфо о сборке", self)
-        a4.triggered.connect(lambda: self.depot_tab._fetch_server_info())
-        sm.addAction(a4)
-
-        stm = mb.addMenu("⚙️ Настройки")
-        a5 = QAction("Тема…", self)
-        a5.triggered.connect(self.show_theme_dialog)
-        stm.addAction(a5)
 
     # ── Settings page ────────────────────────────────────────────────────────
     # Единственное место в приложении, где настраивается: куда публиковать
@@ -372,33 +349,67 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(wbox)
 
-        # ── Дополнительно (депо) ─────────────────────────────────────────────
-        adv_box = QGroupBox("Дополнительно (депо)")
-        adv_form = QFormLayout(adv_box)
+        # "Дополнительно (депо)" (размер чанка/pack-файла, упаковка в
+        # pack-файлы) убрано отсюда целиком — прямой запрос пользователя
+        # (2026-09-23): "настройки депо должны определяться автоматически".
+        # Это не потеря функциональности — _backend_cfg()/
+        # _build_runtime_config() (depot_tab.py) уже читали эти значения
+        # через cfg.get("depot_publish", {}).get(key, DEFAULT), т.е. с
+        # сенсибл-дефолтами (use_packs=True, DEFAULT_CHUNK_SIZE,
+        # DEFAULT_PACK_SIZE) даже при полностью пустом/отсутствующем
+        # "depot_publish" в конфиге — убрать ручные виджеты можно было без
+        # единой правки в логике публикации, дефолты и так уже
+        # подхватываются автоматически. У кого-то в config.json мог остаться
+        # старый явно сохранённый "depot_publish" с прошлого раза — он
+        # просто больше нигде не редактируется из UI, но продолжает
+        # действовать как есть (не сбрасывается принудительно).
 
-        self.chunk_combo = QComboBox()
-        for label, _ in CHUNK_SIZES:
-            self.chunk_combo.addItem(label)
-        adv_form.addRow("Размер чанка:", self.chunk_combo)
+        # ── Отладка ───────────────────────────────────────────────────────────
+        # Прямой запрос пользователя (2026-09-23): "добавь дебаг режим чтобы
+        # при нём лог приложения отправлялся в панель и добавь отправку
+        # крашей" — краши отправляются ВСЕГДА (best-effort, если панель
+        # настроена, см. main.py::_install_crash_handler()), независимо от
+        # этого чекбокса; сам чекбокс включает только ПЕРИОДИЧЕСКУЮ отправку
+        # обычного лога (не только в момент краша). Требует backend="panel" —
+        # у WebDAV нет эквивалентного приёмника отчётов.
+        debug_box = QGroupBox("🐞 Отладка")
+        debug_layout = QVBoxLayout(debug_box)
 
-        self.use_packs_check = QCheckBox(
-            "Упаковывать чанки в pack-файлы (меньше отдельных файлов на диске сервера)"
+        self.debug_mode_check = QCheckBox(
+            "Режим отладки — периодически отправлять лог приложения в TESL-Panel"
         )
-        self.use_packs_check.stateChanged.connect(
-            lambda _: self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
+        self.debug_mode_check.stateChanged.connect(self._on_debug_mode_toggled)
+        debug_layout.addWidget(self.debug_mode_check)
+
+        debug_hint = QLabel(
+            "Краши отправляются в панель всегда, если она подключена (не "
+            "зависит от этого флажка) — раздел «Отчёты» → «Крэши "
+            "TESL-Manager». Этот флажок отвечает только за периодическую "
+            "отправку обычного лога (раздел «Отчёты» → «Логи TESL-Manager»)."
         )
-        adv_form.addRow("", self.use_packs_check)
+        debug_hint.setStyleSheet("color: #888; font-size: 9pt;")
+        debug_hint.setWordWrap(True)
+        debug_layout.addWidget(debug_hint)
 
-        self.pack_size_spin = QSpinBox()
-        self.pack_size_spin.setRange(16, 4096)
-        self.pack_size_spin.setSuffix(" MB")
-        adv_form.addRow("Размер pack-файла:", self.pack_size_spin)
+        layout.addWidget(debug_box)
 
-        btn_save_adv = QPushButton("💾 Сохранить")
-        btn_save_adv.clicked.connect(self._save_advanced_settings)
-        adv_form.addRow("", btn_save_adv)
-
-        layout.addWidget(adv_box)
+        # ── Тема ──────────────────────────────────────────────────────────────
+        # Прямой запрос пользователя (2026-09-23): "убери шапку файл
+        # настройки сервер" — верхнее меню (QMenuBar) с "Файл"/"Сервер"/
+        # "Настройки" удалено целиком (см. _create_ui(), _create_menu()
+        # больше не вызывается). "Проверить соединение"/"Обновить инфо о
+        # сборке" из меню "Сервер" дублировали уже существующие кнопки на
+        # странице "🚀 Релизы" — просто исчезли без замены. "Тема…" была
+        # единственной уникальной функцией меню "Настройки" — перенесена
+        # сюда отдельной кнопкой, чтобы не потерять возможность вручную
+        # переключить тему (автоопределение системной темы по-прежнему
+        # работает само по себе, см. ThemeManager, это ручной override).
+        theme_row = QHBoxLayout()
+        btn_theme = QPushButton("🎨 Тема…")
+        btn_theme.clicked.connect(self.show_theme_dialog)
+        theme_row.addWidget(btn_theme)
+        theme_row.addStretch()
+        layout.addLayout(theme_row)
 
         hint = QLabel(
             "💡 Компоненты сборки (Skyrim/MO2p/MO2ext) и канал (stable/beta/dev) "
@@ -518,16 +529,19 @@ class MainWindow(QMainWindow):
             self.webdav_path_edit.setText(webdav.get("remote_path", ""))
             self.webdav_ssl_check.setChecked(webdav.get("verify_ssl", True))
 
-        # Advanced / depot publish
-        publish = cfg.get("depot_publish", {})
-        self.use_packs_check.setChecked(publish.get("use_packs", True))
-        self.pack_size_spin.setValue(publish.get("pack_size", DEFAULT_PACK_SIZE) // 1024 // 1024)
-        self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
-        target_size = publish.get("chunk_size", DEFAULT_CHUNK_SIZE)
-        for i, (_, size) in enumerate(CHUNK_SIZES):
-            if size == target_size:
-                self.chunk_combo.setCurrentIndex(i)
-                break
+        # depot_publish (chunk_size/use_packs/pack_size) — больше не грузится
+        # в UI, см. "настройки депо должны определяться автоматически" у
+        # _build_settings_tab(); значения по-прежнему читаются с дефолтами
+        # напрямую в depot_tab.py::_backend_cfg()/_build_runtime_config().
+
+        # Debug mode — блокируем сигнал на время загрузки, чтобы не
+        # запустить _on_debug_mode_toggled() (сохранение конфига + попытка
+        # немедленной отправки лога) прямо во время инициализации; таймер/
+        # первую отправку запускает _apply_debug_mode_state(), вызываемый
+        # явно в конце __init__, уже после того как весь UI построен.
+        self.debug_mode_check.blockSignals(True)
+        self.debug_mode_check.setChecked(cfg.get("debug_mode", False))
+        self.debug_mode_check.blockSignals(False)
 
         self.status_panel.set_backend(cfg)
         self.status_panel.set_components(cfg.get(DEPOT_CFG_KEY, {}).get("components", {}))
@@ -590,15 +604,60 @@ class MainWindow(QMainWindow):
         self.log_message(f"✅ Подключено к панели: {decoded['base_url']}")
         self.depot_tab._refresh_builds()
 
-    def _save_advanced_settings(self):
+    # ── Debug mode / отправка отчётов в панель ───────────────────────────────
+    # Прямой запрос пользователя (2026-09-23): см. debug_reporter.py за
+    # обоснование выбора типов отчётов и best-effort-семантику.
+
+    def _on_debug_mode_toggled(self, _state: int = 0):
         cfg = self.config
-        cfg["depot_publish"] = {
-            "use_packs":  self.use_packs_check.isChecked(),
-            "chunk_size": CHUNK_SIZES[self.chunk_combo.currentIndex()][1],
-            "pack_size":  self.pack_size_spin.value() * 1024 * 1024,
-        }
+        cfg["debug_mode"] = self.debug_mode_check.isChecked()
         self.file_selector.save_config()
-        self.log_message("✅ Дополнительные настройки депо сохранены")
+        self._apply_debug_mode_state()
+
+    def _apply_debug_mode_state(self):
+        """Синхронизирует таймер периодической отправки с текущим
+        состоянием чекбокса — вызывается и при переключении вручную, и
+        один раз при старте (после _load_initial_data(), чтобы сессия,
+        начатая с уже включённым дебаг-режимом, сразу же отправила
+        стартовый снимок лога, а не ждала первого тика через 5 минут)."""
+        if self.debug_mode_check.isChecked():
+            if not self._debug_timer.isActive():
+                self._debug_timer.start()
+                self.log_message("🐞 Режим отладки включён — лог будет периодически отправляться в панель")
+            self._upload_debug_log()
+        else:
+            if self._debug_timer.isActive():
+                self._debug_timer.stop()
+
+    def _upload_debug_log(self):
+        """Best-effort — молча пропускает, если панель не настроена/backend
+        не "panel"/сеть недоступна (см. debug_reporter.upload_report()) —
+        неудачная отправка лога не должна сама попасть в лог как ошибка,
+        иначе дебаг-режим начнёт спамить сам себя при недоступной сети.
+        Сама отправка (сетевой PUT, до 10с таймаут) — в фоновом потоке, не
+        на главном: это вызывается автоматически каждые 5 минут ПОКА
+        приложение активно используется (в т.ч. во время публикации), и
+        блокировать GUI на длительность сетевого таймаута ради
+        best-effort-лога было бы неоправданно — тот же принцип, что и у
+        остальных сетевых операций в этом GUI (QThread-воркеры)."""
+        cfg = self.config
+        if not cfg.get("debug_mode"):
+            return
+        panel_cfg = cfg.get("panel", {})
+        if not panel_cfg.get("base_url") or not panel_cfg.get("token"):
+            return
+        try:
+            data = LOG_FILE.read_bytes() if LOG_FILE.exists() else "\n".join(self._log_lines).encode("utf-8")
+        except Exception:
+            data = "\n".join(self._log_lines).encode("utf-8")
+
+        import threading
+        from debug_reporter import upload_report
+        threading.Thread(
+            target=upload_report,
+            args=(panel_cfg, "manager_log", self._debug_session_ts, "log.txt", data),
+            daemon=True,
+        ).start()
 
     # ── WebDAV ────────────────────────────────────────────────────────────────
 

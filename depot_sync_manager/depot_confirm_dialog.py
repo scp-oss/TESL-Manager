@@ -6,7 +6,7 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QListWidget, QTabWidget, QWidget, QGroupBox,
-    QTreeWidget, QTreeWidgetItem, QSplitter, QFrame
+    QTreeWidget, QTreeWidgetItem, QSplitter, QFrame, QTextEdit
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
@@ -115,6 +115,22 @@ class DepotConfirmDialog(QDialog):
         summary_label.setWordWrap(True)
         layout.addWidget(summary_label)
 
+        # ── Описание сборки ──────────────────────────────────────────────────
+        # Прямой запрос пользователя (2026-09-23): "добавь описание к
+        # сборке в момент опубликовать" — вводится здесь, а не заранее на
+        # странице "Релизы", т.к. к этому моменту уже видна реальная delta
+        # (что именно меняется) — писать описание изменений разумнее,
+        # когда уже понятно, что публикуется. Необязательное поле,
+        # уходит в DepotManifest.description → versions/<id>.json и
+        # depot.json (см. chunk_manager.py/depot_sync_manager.py).
+        desc_box = QGroupBox("Описание сборки (необязательно)")
+        desc_layout = QVBoxLayout(desc_box)
+        self.description_edit = QTextEdit()
+        self.description_edit.setPlaceholderText("Что изменилось в этой публикации…")
+        self.description_edit.setMaximumHeight(70)
+        desc_layout.addWidget(self.description_edit)
+        layout.addWidget(desc_box)
+
         # ── Вкладки с деталями ───────────────────────────────────────────────
         tabs = QTabWidget()
 
@@ -168,6 +184,9 @@ class DepotConfirmDialog(QDialog):
         btn_layout.addStretch()
 
         layout.addLayout(btn_layout)
+
+    def get_description(self) -> str:
+        return self.description_edit.toPlainText().strip()
 
     def _make_file_tab(self, paths: list, manifest: DepotManifest, label: str) -> QWidget:
         w = QWidget()

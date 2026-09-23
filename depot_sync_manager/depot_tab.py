@@ -511,6 +511,28 @@ class DepotTab(QWidget):
         self._thread.start()
 
     def _on_scan_done(self, new_manifest: DepotManifest, delta: DepotDelta, prev_manifest):
+        # НАЙДЕНА РЕАЛЬНАЯ ПРИЧИНА обоих живых крэшей без следа (Skyrim-
+        # хэширование и повторный крэш тем же вечером, "QThread: Destroyed
+        # while thread '' is still running" — на этот раз видно в консоли,
+        # не только в --noconsole сборке) — 2026-09-23. DepotBuildWorker.run()
+        # в сканирующем заходе (без confirmed_delta) эмитит scan_done, но
+        # НИКОГДА не эмитит свой собственный сигнал finished — а именно на
+        # finished подписан self._cleanup_thread() (через _on_finished).
+        # Итог: после успешного скана self._thread/self._worker остаются
+        # висеть НЕОЧИЩЕННЫМИ (QThread.run() уже вернул управление и поток
+        # реально завершился, но Qt-обёртка не дождалась/не quit()/wait()).
+        # Как только пользователь подтверждает публикацию, _start_upload()
+        # тут же делает `self._thread = QThread()` — старый QThread теряет
+        # последнюю Python-ссылку и уходит в GC, пока Qt ещё считает его
+        # частью незавершённого потока — ровно то, что Qt ругает как
+        # "QThread: Destroyed while thread '...' is still running", и на
+        # некоторых платформах/сборках PyQt это не просто warning, а
+        # реальный abort() всего процесса. Фикс: явно закрыть/дождаться
+        # СКАНИРУЮЩИЙ поток здесь же, до того как _start_upload() создаст
+        # новый — к моменту scan_done это уже безопасно (run() гарантированно
+        # успел вернуть управление, иначе сигнал бы не долетел).
+        self._cleanup_thread()
+
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
 
@@ -553,6 +575,7 @@ class DepotTab(QWidget):
             return
 
         if dlg.exec() == dlg.DialogCode.Accepted:
+            new_manifest.description = dlg.get_description()
             self._start_upload(new_manifest, delta)
         else:
             self._log("❌ Публикация отменена")

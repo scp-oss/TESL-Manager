@@ -57,6 +57,23 @@ UPLOAD_WORKERS   = 4
 
 DAV_NS = "{DAV:}"
 
+
+def _fmt_eta(seconds: float) -> str:
+    """Тот же формат, что у TESL (лаунчер, core/chunk_installer.py::
+    _fmt_eta) — прямой запрос пользователя "добавь прогресс бар с данными
+    как в лаунчере" (2026-09-23): статус-бар публикации должен выглядеть
+    так же, как статус-бар установки, а не изобретать свой формат."""
+    if seconds < 0 or seconds != seconds:   # NaN check без импорта math
+        return "?"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}ч{m:02d}м"
+    if m:
+        return f"{m}м{s:02d}с"
+    return f"{s}с"
+
 NC_PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:">
   <D:prop>
@@ -552,6 +569,17 @@ class DepotSyncManager(QObject):
                 except Exception:
                     return chunk_id, False, 0
 
+            # Прогресс-бар "как в лаунчере" (прямой запрос пользователя,
+            # 2026-09-23): процент + скорость + ETA вместо голого "Чанк
+            # <хэш>…" — то же скользящее среднее (окно сэмплов не чаще
+            # раза в 0.5с, экспоненциальное сглаживание alpha=0.3), что
+            # уже использует TESL/core/chunk_installer.py для скачивания.
+            total_bytes = sum(sz for (_, _, sz) in chunk_source.values())
+            uploaded_bytes = 0
+            last_sample_t = time.time()
+            last_sample_uploaded = 0
+            smoothed_speed = 0.0
+
             with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
                 futures = {
                     pool.submit(_read_and_upload, cid): cid
@@ -566,7 +594,25 @@ class DepotSyncManager(QObject):
 
                     chunk_id, ok, size = future.result()
                     done += 1
-                    self.progress.emit(done, total, f"Чанк {chunk_id[:12]}…")
+                    if ok:
+                        uploaded_bytes += size
+
+                    now = time.time()
+                    sample_dt = now - last_sample_t
+                    if sample_dt >= 0.5:
+                        inst = (uploaded_bytes - last_sample_uploaded) / sample_dt
+                        alpha = 0.3
+                        smoothed_speed = inst if smoothed_speed == 0 else (
+                            alpha * inst + (1 - alpha) * smoothed_speed)
+                        last_sample_t = now
+                        last_sample_uploaded = uploaded_bytes
+                    pct = int(uploaded_bytes / total_bytes * 100) if total_bytes else 100
+                    bytes_remaining = total_bytes - uploaded_bytes
+                    eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
+                    self.progress.emit(
+                        int(uploaded_bytes), int(total_bytes),
+                        f"{pct}% — ⬆ {smoothed_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
+                    )
 
                     if ok:
                         self.log.emit(
@@ -686,13 +732,43 @@ class DepotSyncManager(QObject):
                 pw.finalize()
 
                 self.log.emit(f"📤 Загружаем {len(pw.pack_paths)} pack-файл(ов)…")
+                # Прогресс-бар "как в лаунчере" (прямой запрос пользователя,
+                # 2026-09-23) — та же схема сглаживания, что в execute_sync()
+                # выше, но по гранулярности pack-файлов (нет byte-level
+                # callback'а внутри dav.put_file(), это грубее per-chunk
+                # сэмплирования launcher'а, но для файлов по умолчанию
+                # 256MB даёт обновление в разумном темпе на реальной сборке).
+                total_upload_bytes = sum(p.stat().st_size for p in pw.pack_paths)
+                uploaded_bytes = 0
+                last_sample_t = time.time()
+                last_sample_uploaded = 0
+                smoothed_speed = 0.0
                 for pack_path in pw.pack_paths:
                     if stop_fn and stop_fn():
                         return False, "Остановлено пользователем"
                     ok = dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path)
                     if not ok:
                         return False, f"Не удалось загрузить {pack_path.name}"
-                    self.log.emit(f"  ✅ {pack_path.name} ({pack_path.stat().st_size // 1024} KB)")
+                    pack_size = pack_path.stat().st_size
+                    uploaded_bytes += pack_size
+                    self.log.emit(f"  ✅ {pack_path.name} ({pack_size // 1024} KB)")
+
+                    now = time.time()
+                    sample_dt = now - last_sample_t
+                    if sample_dt >= 0.5:
+                        inst = (uploaded_bytes - last_sample_uploaded) / sample_dt
+                        alpha = 0.3
+                        smoothed_speed = inst if smoothed_speed == 0 else (
+                            alpha * inst + (1 - alpha) * smoothed_speed)
+                        last_sample_t = now
+                        last_sample_uploaded = uploaded_bytes
+                    pct = int(uploaded_bytes / total_upload_bytes * 100) if total_upload_bytes else 100
+                    bytes_remaining = total_upload_bytes - uploaded_bytes
+                    eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
+                    self.progress.emit(
+                        int(uploaded_bytes), int(total_upload_bytes),
+                        f"{pct}% — ⬆ {smoothed_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
+                    )
 
                 merged = {**existing_index, **pw.locations}
                 index_path = pack_dir / CHUNK_INDEX_NAME
@@ -758,6 +834,7 @@ class DepotSyncManager(QObject):
                     "file_count":   len(m.files),
                     "total_size":   m.total_size,
                     "manifest":     "depot_manifest.json",
+                    "description":  m.description,
                 }
             },
             "updated_at": datetime.now().isoformat(),

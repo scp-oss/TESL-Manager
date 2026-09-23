@@ -495,6 +495,14 @@ class DepotManifest:
         self.files:          Dict[str, FileEntry] = {}
         self.excludes:       List[str] = []
         self.local_dir:      str = ""
+        # Описание сборки — прямой запрос пользователя (2026-09-23,
+        # "добавь описание к сборке в момент опубликовать"): свободный
+        # текст (что изменилось в этой публикации), вводится в
+        # DepotConfirmDialog непосредственно перед подтверждением
+        # публикации (см. depot_tab.py::_on_scan_done()), а не заранее —
+        # к этому моменту уже видна delta (новые/изменённые файлы), так
+        # что описывать есть что. Пусто по умолчанию — необязательное поле.
+        self.description:    str = ""
 
     # ── Сериализация ──────────────────────────────────────────────────────────
 
@@ -512,6 +520,7 @@ class DepotManifest:
             "created_at":     self.created_at,
             "local_dir":      self.local_dir,
             "excludes":       self.excludes,
+            "description":    self.description,
             "stats": {
                 "file_count":  len(self.files),
                 "total_size":  sum(e.size for e in self.files.values()),
@@ -540,6 +549,7 @@ class DepotManifest:
         m.created_at     = d.get("created_at", "")
         m.local_dir      = d.get("local_dir", "")
         m.excludes       = d.get("excludes", [])
+        m.description    = d.get("description", "")
         m.files = {
             path: FileEntry.from_dict(path, info)
             for path, info in d.get("files", {}).items()
