@@ -13,7 +13,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
-from config import APPDATA_DIR, CONFIG_FILE, DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES
+from config import (
+    APPDATA_DIR, CONFIG_FILE, DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES,
+    get_window_title,
+)
 from file_selector import FileSelector
 from manifest_manager import ManifestManager
 from themes import ThemeManager
@@ -119,7 +122,7 @@ class StatusBar(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Uploder — Менеджер релизов")
+        self.setWindowTitle(get_window_title())
         self.resize(1150, 820)
         self.setMinimumSize(900, 620)
 

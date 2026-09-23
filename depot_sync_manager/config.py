@@ -3,6 +3,38 @@ import os
 from pathlib import Path
 
 
+def get_manager_commit() -> str:
+    """Короткий git-хэш текущего чекаута — та же идея и реализация, что
+    TESL/launcher/config.py::get_launcher_commit() (прямой запрос
+    пользователя показать коммит в заголовке окна и здесь тоже, тем же
+    способом, что уже был сделан для лаунчера, см. его CLAUDE.md
+    "Window title format: TESL [commit version]"). Работает только при
+    запуске из git-чекаута — git сам находит .git, поднимаясь от cwd
+    вверх по дереву. В собранном PyInstaller .exe .git не бандлится —
+    возвращает "?", это не ошибка, просто неоткуда взять."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "?"
+
+
+def get_window_title() -> str:
+    """Заголовок главного окна — "Uploder [<git-хэш>] — Менеджер релизов".
+    Вычисляется при каждом вызове (main_window.py::__init__), не константа
+    времени импорта — тот же принцип, что и у get_launcher_commit() в TESL,
+    ради живого хэша, если сессия перезапустит окно после git pull без
+    перезапуска процесса целиком."""
+    return f"Uploder [{get_manager_commit()}] — Менеджер релизов"
+
+
 def calculate_max_workers():
     cores = os.cpu_count() or 4
     if cores <= 4:
