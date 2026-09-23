@@ -13,6 +13,8 @@ mkcol() здесь — no-op (всегда True): панель создаёт р
 оставлен с той же сигнатурой, чтобы вызывающий код (`ensure_depot_structure`,
 `_ensure_chunk_subdir`) не знал и не заботился, какой транспорт активен.
 """
+import base64
+import json
 import time
 from typing import List, Optional, Set, Tuple
 
@@ -25,6 +27,39 @@ TIMEOUT_GET     = 60
 
 MAX_RETRIES   = 3
 RETRY_BACKOFF = (1, 3, 7)
+
+
+# ── "Код настройки" — один base64(JSON) с адресом панели и токеном ──────────
+# (см. TESL-Panel::panel/app.py::_generate_setup_code / /admin/settings) —
+# прямой запрос пользователя: панель сама генерирует один код, вставляется
+# один раз в GUI (main_window.py's Settings page), вместо URL+токена по
+# отдельности. Формат зеркалит серверную сторону 1:1 — если он там
+# изменится, менять здесь тоже, они не идут через общий модуль (разные
+# репозитории/языковые рантаймы для этого куска нет смысла разделять
+# дальше, чем уже есть).
+
+def decode_setup_code(code: str) -> Optional[dict]:
+    """{"base_url": ..., "token": ...} или None, если код нечитаем."""
+    try:
+        raw = base64.b64decode(code.strip(), validate=False)
+        payload = json.loads(raw.decode("utf-8"))
+        base_url = str(payload.get("base_url", "")).strip().rstrip("/")
+        token    = str(payload.get("token", "")).strip()
+        if not base_url or not token:
+            return None
+        return {"base_url": base_url, "token": token}
+    except Exception:
+        return None
+
+
+def encode_setup_code(base_url: str, token: str) -> str:
+    """Обратное к decode_setup_code() — используется, чтобы при повторном
+    открытии окна показать в поле кода то же значение, что уже сохранено
+    (base_url/token читаются из cfg["panel"], а не только из свежевведённого
+    кода), а не оставлять поле пустым для уже подключённых пользователей."""
+    payload = {"v": 1, "base_url": base_url.rstrip("/"), "token": token}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
 
 
 class PanelHTTP:

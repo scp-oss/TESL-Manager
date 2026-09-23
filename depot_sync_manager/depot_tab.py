@@ -25,7 +25,7 @@ from typing import Dict
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QComboBox, QProgressBar, QMessageBox,
+    QPushButton, QComboBox, QProgressBar, QMessageBox, QInputDialog,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -63,11 +63,41 @@ class DepotTab(QWidget):
         self._init_ui()
         self._load_settings()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.build_combo.count() == 0 and self._backend_cfg()["panel"].get("base_url"):
+            self._refresh_builds()
+
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _init_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(10)
+
+        # ── Сборка (проект на панели) ────────────────────────────────────────
+        # Прямой запрос пользователя: выбрать существующую сборку или
+        # добавить новую с именем — прямо здесь, на странице "Релизы", а
+        # не только на "Настройках" (там остаётся код подключения к
+        # панели самой — URL/токен, см. main_window.py). "Сборка" — то же
+        # понятие, что TESL-Panel называет "проект"
+        # (panel/templates/admin.html: заголовок "Сборки") — combo пишет
+        # в тот же cfg["panel"]["project"], который читает
+        # _build_runtime_config() ниже.
+        build_box = QGroupBox("Сборка")
+        build_row = QHBoxLayout(build_box)
+        self.build_combo = QComboBox()
+        self.build_combo.setMinimumWidth(200)
+        self.build_combo.currentIndexChanged.connect(self._save_build_choice)
+        build_row.addWidget(self.build_combo, stretch=1)
+        btn_refresh_build = QPushButton("🔄")
+        btn_refresh_build.setFixedWidth(32)
+        btn_refresh_build.setToolTip("Обновить список сборок с сервера")
+        btn_refresh_build.clicked.connect(self._refresh_builds)
+        build_row.addWidget(btn_refresh_build)
+        btn_new_build = QPushButton("➕ Новая сборка")
+        btn_new_build.clicked.connect(self._create_new_build)
+        build_row.addWidget(btn_new_build)
+        root.addWidget(build_box)
 
         # ── Компоненты сборки (Skyrim / MO2p / MO2ext) ──────────────────────
         comp_box = QGroupBox("Компоненты сборки")
@@ -198,6 +228,66 @@ class DepotTab(QWidget):
         idx = self.channel_combo.findText(ch)
         if idx >= 0:
             self.channel_combo.setCurrentIndex(idx)
+
+        saved_project = self._get_config().get("panel", {}).get("project", "")
+        if saved_project:
+            self.build_combo.blockSignals(True)
+            self.build_combo.addItem(saved_project)
+            self.build_combo.setCurrentIndex(0)
+            self.build_combo.blockSignals(False)
+
+    # ── Build (project) selection ─────────────────────────────────────────────
+
+    def _save_build_choice(self, _idx: int = 0):
+        cfg = self._get_config()
+        panel = dict(cfg.get("panel", {}))
+        panel["project"] = self.build_combo.currentText().strip()
+        cfg["panel"] = panel
+        self.mw.file_selector.save_config()
+        if hasattr(self.mw, "status_panel"):
+            self.mw.status_panel.set_backend(cfg)
+
+    def _refresh_builds(self):
+        panel = self._backend_cfg()["panel"]
+        if not panel.get("base_url"):
+            QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к панели на странице «⚙️ Настройки»!")
+            return
+        from panel_client import PanelHTTP
+        client = PanelHTTP(base_url=panel["base_url"], project="", token=panel.get("token", ""))
+        names = client.list_projects()
+        client.close()
+        current = self.build_combo.currentText()
+        self.build_combo.blockSignals(True)
+        self.build_combo.clear()
+        self.build_combo.addItems(names)
+        if current:
+            idx = self.build_combo.findText(current)
+            if idx >= 0:
+                self.build_combo.setCurrentIndex(idx)
+        self.build_combo.blockSignals(False)
+        self._log(f"📋 Сборок на панели: {len(names)}")
+
+    def _create_new_build(self):
+        panel = self._backend_cfg()["panel"]
+        if not panel.get("base_url") or not panel.get("token"):
+            QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к панели на странице «⚙️ Настройки»!")
+            return
+        name, ok = QInputDialog.getText(self, "Новая сборка", "Имя сборки (буквы/цифры/_/-):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        from panel_client import PanelHTTP
+        client = PanelHTTP(base_url=panel["base_url"], project="", token=panel.get("token", ""))
+        created, msg = client.create_project(name)
+        client.close()
+        if created:
+            self._log(f"✅ Сборка создана: {name}")
+            self._refresh_builds()
+            idx = self.build_combo.findText(name)
+            if idx >= 0:
+                self.build_combo.setCurrentIndex(idx)
+        else:
+            QMessageBox.warning(self, "Ошибка", msg)
 
     def _save_components(self):
         cfg = self._get_config()

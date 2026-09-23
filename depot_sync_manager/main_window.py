@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QFileDialog,
     QMessageBox, QGroupBox, QLineEdit, QCheckBox,
     QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QSpinBox,
-    QFormLayout, QStatusBar, QFrame, QInputDialog, QScrollArea,
+    QFormLayout, QStatusBar, QFrame, QScrollArea,
 )
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtCore import pyqtSignal
@@ -288,33 +288,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(backend_box)
 
         # ── TESL-Panel ────────────────────────────────────────────────────────
+        # Прямой запрос пользователя (2026-09-23): вместо URL+токена по
+        # отдельности — одна строка ("код настройки"), сгенерированная
+        # самой панелью (/admin/settings, см. её CLAUDE.md) и вставляемая
+        # сюда целиком. decode_setup_code()/encode_setup_code() —
+        # panel_client.py, формат зеркалит серверную сторону 1:1.
         panel_box = QGroupBox("TESL-Panel")
         panel_form = QFormLayout(panel_box)
-        self.panel_url_edit = QLineEdit()
-        self.panel_url_edit.setPlaceholderText("https://tesl-panel.neth.de5.net")
-        panel_form.addRow("URL панели:", self.panel_url_edit)
 
-        proj_row = QHBoxLayout()
-        self.panel_project_combo = QComboBox()
-        self.panel_project_combo.setMinimumWidth(160)
-        proj_row.addWidget(self.panel_project_combo, stretch=1)
-        btn_refresh_proj = QPushButton("🔄")
-        btn_refresh_proj.setFixedWidth(32)
-        btn_refresh_proj.setToolTip("Обновить список проектов с сервера")
-        btn_refresh_proj.clicked.connect(self._refresh_panel_projects)
-        proj_row.addWidget(btn_refresh_proj)
-        btn_new_proj = QPushButton("➕ Новый")
-        btn_new_proj.clicked.connect(self._create_new_panel_project)
-        proj_row.addWidget(btn_new_proj)
-        panel_form.addRow("Проект:", proj_row)
+        code_row = QHBoxLayout()
+        self.panel_setup_code_edit = QLineEdit()
+        self.panel_setup_code_edit.setPlaceholderText(
+            "Вставьте код из панели: Настройки → Код настройки для TESL-Manager"
+        )
+        code_row.addWidget(self.panel_setup_code_edit, stretch=1)
+        btn_connect_code = QPushButton("🔌 Подключить по коду")
+        btn_connect_code.clicked.connect(self._connect_panel_by_code)
+        code_row.addWidget(btn_connect_code)
+        panel_form.addRow("Код настройки:", code_row)
 
-        self.panel_token_edit = QLineEdit()
-        self.panel_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        panel_form.addRow("Upload-токен:", self.panel_token_edit)
+        self.panel_connection_label = QLabel("Не подключено")
+        self.panel_connection_label.setStyleSheet("color: #888; font-size: 9pt;")
+        panel_form.addRow("", self.panel_connection_label)
 
-        btn_save_panel = QPushButton("💾 Сохранить")
-        btn_save_panel.clicked.connect(self._save_panel_settings)
-        panel_form.addRow("", btn_save_panel)
+        panel_hint = QLabel(
+            "💡 Выбор сборки (какой проект на панели публиковать) — на странице «🚀 Релизы»."
+        )
+        panel_hint.setStyleSheet("color: #888; font-size: 9pt;")
+        panel_form.addRow("", panel_hint)
+
         layout.addWidget(panel_box)
 
         # ── WebDAV ────────────────────────────────────────────────────────────
@@ -473,14 +475,19 @@ class MainWindow(QMainWindow):
         self.backend_combo.setCurrentIndex(0 if cfg.get("backend", "panel") == "panel" else 1)
         self.backend_combo.blockSignals(False)
 
-        # Panel
+        # Panel — если уже подключено раньше (base_url+token в cfg), поле
+        # кода не должно выглядеть пустым: перекодируем сохранённые
+        # значения обратно в код настройки (см. panel_client.
+        # encode_setup_code()), тот же принцип, что и в TESL-Panel самой
+        # (код детерминирован от url+token, генерировать его заново на
+        # сервере/клиенте — одно и то же).
         panel = cfg.get("panel", {})
-        self.panel_url_edit.setText(panel.get("base_url", ""))
-        self.panel_token_edit.setText(panel.get("token", ""))
-        saved_project = panel.get("project", "")
-        if saved_project:
-            self.panel_project_combo.addItem(saved_project)
-            self.panel_project_combo.setCurrentIndex(0)
+        base_url = panel.get("base_url", "")
+        token    = panel.get("token", "")
+        if base_url and token:
+            from panel_client import encode_setup_code
+            self.panel_setup_code_edit.setText(encode_setup_code(base_url, token))
+            self._update_panel_connection_label(base_url)
 
         # WebDAV
         webdav = self.file_selector.get_webdav_config()
@@ -514,58 +521,51 @@ class MainWindow(QMainWindow):
         self.status_panel.set_backend(cfg)
         self.log_message(f"✅ Backend публикации: {cfg['backend']}")
 
-    def _refresh_panel_projects(self):
-        base_url = self.panel_url_edit.text().strip().rstrip("/")
-        if not base_url:
-            QMessageBox.warning(self, "Ошибка", "Заполните URL панели!")
-            return
-        from panel_client import PanelHTTP
-        client = PanelHTTP(base_url=base_url, project="", token=self.panel_token_edit.text())
-        names = client.list_projects()
-        client.close()
-        current = self.panel_project_combo.currentText()
-        self.panel_project_combo.clear()
-        self.panel_project_combo.addItems(names)
-        if current:
-            idx = self.panel_project_combo.findText(current)
-            if idx >= 0:
-                self.panel_project_combo.setCurrentIndex(idx)
-        self.log_message(f"📋 Проектов на панели: {len(names)}")
+    def _update_panel_connection_label(self, base_url: str):
+        from urllib.parse import urlparse
+        host = urlparse(base_url).netloc or base_url
+        self.panel_connection_label.setText(f"✅ Подключено: {host}")
+        self.panel_connection_label.setStyleSheet("color: #4caf6b; font-size: 9pt;")
 
-    def _create_new_panel_project(self):
-        base_url = self.panel_url_edit.text().strip().rstrip("/")
-        token = self.panel_token_edit.text()
-        if not base_url or not token:
-            QMessageBox.warning(self, "Ошибка", "Заполните URL панели и upload-токен!")
+    def _connect_panel_by_code(self):
+        """Разбирает код настройки (см. panel_client.decode_setup_code(),
+        сгенерирован на TESL-Panel: Настройки → Код настройки) и сохраняет
+        base_url/token — прямой запрос пользователя: одна строка вместо
+        URL+токена по отдельности, ничего кроме этого поля для авторизации
+        вводить не нужно."""
+        from panel_client import decode_setup_code
+        decoded = decode_setup_code(self.panel_setup_code_edit.text())
+        if decoded is None:
+            QMessageBox.warning(
+                self, "Ошибка",
+                "Не удалось разобрать код настройки — проверьте, что он скопирован "
+                "полностью (Настройки → Код настройки в TESL-Panel).",
+            )
             return
-        name, ok = QInputDialog.getText(self, "Новый проект", "Имя проекта (буквы/цифры/_/-):")
-        name = (name or "").strip()
-        if not ok or not name:
-            return
-        from panel_client import PanelHTTP
-        client = PanelHTTP(base_url=base_url, project="", token=token)
-        created, msg = client.create_project(name)
-        client.close()
-        if created:
-            self.log_message(f"✅ Проект создан: {name}")
-            self._refresh_panel_projects()
-            idx = self.panel_project_combo.findText(name)
-            if idx >= 0:
-                self.panel_project_combo.setCurrentIndex(idx)
-        else:
-            QMessageBox.warning(self, "Ошибка", msg)
 
-    def _save_panel_settings(self):
         cfg = self.config
-        cfg["panel"] = {
-            "base_url":   self.panel_url_edit.text().strip().rstrip("/"),
-            "project":    self.panel_project_combo.currentText().strip(),
-            "token":      self.panel_token_edit.text(),
+        old_base_url = cfg.get("panel", {}).get("base_url", "")
+        panel_cfg = {
+            "base_url":   decoded["base_url"],
+            "token":      decoded["token"],
+            "project":    cfg.get("panel", {}).get("project", ""),
             "verify_ssl": True,
         }
+        # Другой адрес панели — старый выбранный проект почти наверняка
+        # относится к другой панели, список нужно перезагрузить с нуля,
+        # а не молча оставлять невалидный выбор. Сам combo выбора сборки
+        # живёт теперь на странице "Релизы" (DepotTab.build_combo), не
+        # здесь — см. её же _refresh_builds()/_create_new_build().
+        if decoded["base_url"] != old_base_url:
+            panel_cfg["project"] = ""
+            self.depot_tab.build_combo.clear()
+
+        cfg["panel"] = panel_cfg
         self.file_selector.save_config()
+        self._update_panel_connection_label(decoded["base_url"])
         self.status_panel.set_backend(cfg)
-        self.log_message("✅ Настройки TESL-Panel сохранены")
+        self.log_message(f"✅ Подключено к панели: {decoded['base_url']}")
+        self.depot_tab._refresh_builds()
 
     def _save_advanced_settings(self):
         cfg = self.config
