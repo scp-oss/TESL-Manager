@@ -15,6 +15,8 @@ DepotSyncManager — сетевой слой depot-системы.
 
 import os
 import json
+import shutil
+import tempfile
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -31,7 +33,13 @@ from chunk_manager import (
     ChunkManager, DepotManifest, DepotDelta, FileEntry, ChunkInfo,
     CHUNKS_DIR, VERSIONS_DIR, DEPOT_META, DEFAULT_CHUNK_SIZE,
 )
+from pack_writer import (
+    PackWriter, DEFAULT_PACK_SIZE, write_chunk_index_db, read_chunk_index_db,
+)
 from threads import ThreadSafeWorker
+
+PACKS_DIR = "packs"
+CHUNK_INDEX_NAME = "chunk_index.db"
 
 
 # ── Константы (откалиброваны по probe) ───────────────────────────────────────
@@ -391,6 +399,13 @@ class DepotSyncManager(QObject):
         # list_chunk_ids/test_connection/close).
         self.backend     = config.get("backend", "webdav")
         self.remote_path = self.webdav_cfg.get("remote_path", "").strip("/")
+        # Упаковка чанков в pack-файлы вместо chunks/<xx>/<id> — см.
+        # execute_sync_packed()/pack_writer.py и CLAUDE.md "Упаковка чанков
+        # в pack-файлы". Отдельная от backend ось — можно паковать чанки И
+        # публиковать через WebDAV, или не паковать и публиковать через
+        # panel, любая комбинация валидна.
+        self.use_packs = bool(config.get("use_packs", False))
+        self.pack_size = int(config.get("depot", {}).get("pack_size", DEFAULT_PACK_SIZE))
         self._dav = None   # NextcloudDAV | PanelHTTP, в зависимости от self.backend
 
     def _get_dav(self):
@@ -427,7 +442,13 @@ class DepotSyncManager(QObject):
 
     def ensure_depot_structure(self) -> bool:
         dav = self._get_dav()
-        for d in [self.remote_path, self._rp(CHUNKS_DIR), self._rp(VERSIONS_DIR)]:
+        dirs = [self.remote_path, self._rp(VERSIONS_DIR)]
+        # packs/ вместо chunks/ при упаковке — оба варианта безвредно
+        # создать заранее, даже если этот конкретный запуск использует
+        # только один из них (mkcol на panel-транспорте и так no-op, см.
+        # panel_client.py).
+        dirs.append(self._rp(PACKS_DIR) if self.use_packs else self._rp(CHUNKS_DIR))
+        for d in dirs:
             if not d:
                 continue
             if not dav.exists(d):
@@ -586,6 +607,132 @@ class DepotSyncManager(QObject):
         )
         return True, msg
 
+    # ── Упакованная публикация (pack-файлы + chunk_index.db) ────────────────
+
+    def execute_sync_packed(
+        self,
+        new_manifest:  DepotManifest,
+        delta:         DepotDelta,
+        local_dir:     str,
+        stop_fn=None,
+        pause_fn=None,
+    ) -> Tuple[bool, str]:
+        """То же самое, что execute_sync() — тот же delta, та же итоговая
+        структура depot.json/versions/<key>.json/depot_manifest.json — но
+        физическая загрузка чанков идёт через pack-файлы вместо одного
+        файла на чанк (см. pack_writer.py и CLAUDE.md "Упаковка чанков в
+        pack-файлы"). Включается через config["use_packs"]=True —
+        DepotBuildWorker.run() решает, какой из двух методов вызвать, сам
+        этот класс не переключается неявно."""
+        dav = self._get_dav()
+        total = len(delta.chunks_to_upload)
+        pack_dir = Path(tempfile.mkdtemp(prefix="tesl_pack_"))
+        try:
+            if total > 0:
+                self.log.emit("📥 Скачиваем текущий chunk_index.db (если есть)…")
+                existing_index: Dict[str, Tuple[str, int, int]] = {}
+                idx_bytes = dav.get_bytes(self._rp(CHUNK_INDEX_NAME))
+                if idx_bytes is not None:
+                    tmp_idx = pack_dir / "existing_chunk_index.db"
+                    tmp_idx.write_bytes(idx_bytes)
+                    existing_index = read_chunk_index_db(tmp_idx)
+                    self.log.emit(f"📋 В существующем индексе: {len(existing_index)} чанков")
+
+                chunk_source: Dict[str, Tuple[str, int, int]] = {}
+                for path, entry in new_manifest.files.items():
+                    for chunk in entry.chunks:
+                        if chunk.chunk_id in delta.chunks_to_upload:
+                            chunk_source[chunk.chunk_id] = (path, chunk.offset, chunk.size)
+
+                self.log.emit(f"📦 Упаковываем {total} чанков ({self.pack_size / 1024 / 1024:.1f}MB/pack)…")
+                pw = PackWriter(pack_dir / "out", pack_size=self.pack_size)
+                done = 0
+                # sorted() — тот же порядок, в котором лаунчер и так
+                # запрашивает чанки (см. TESL/core/chunk_installer.py) —
+                # упаковка в этом же порядке и есть весь смысл схемы
+                # (реальная последовательность на диске сервера, не
+                # надежда на ФС).
+                for cid in sorted(delta.chunks_to_upload):
+                    if stop_fn and stop_fn():
+                        return False, "Остановлено пользователем"
+                    if pause_fn:
+                        pause_fn()
+                    src = chunk_source.get(cid)
+                    if src is None:
+                        continue
+                    rel_path, offset, size = src
+                    try:
+                        fp = Path(local_dir) / rel_path
+                        with open(fp, "rb") as f:
+                            f.seek(offset)
+                            data = f.read(size)
+                        pw.add_chunk(cid, data)
+                    except Exception as e:
+                        return False, f"Ошибка чтения {rel_path} при упаковке: {e}"
+                    done += 1
+                    self.progress.emit(done, total, f"Упаковка {cid[:12]}…")
+                pw.finalize()
+
+                self.log.emit(f"📤 Загружаем {len(pw.pack_paths)} pack-файл(ов)…")
+                for pack_path in pw.pack_paths:
+                    if stop_fn and stop_fn():
+                        return False, "Остановлено пользователем"
+                    ok = dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path)
+                    if not ok:
+                        return False, f"Не удалось загрузить {pack_path.name}"
+                    self.log.emit(f"  ✅ {pack_path.name} ({pack_path.stat().st_size // 1024} KB)")
+
+                merged = {**existing_index, **pw.locations}
+                index_path = pack_dir / CHUNK_INDEX_NAME
+                write_chunk_index_db(index_path, merged)
+                ok = dav.put_file(self._rp(CHUNK_INDEX_NAME), index_path)
+                if not ok:
+                    return False, "Не удалось загрузить chunk_index.db"
+                self.log.emit(f"📋 chunk_index.db обновлён: {len(merged)} чанков всего")
+            else:
+                self.log.emit("ℹ️  Новых чанков нет")
+        finally:
+            shutil.rmtree(pack_dir, ignore_errors=True)
+
+        self.log.emit(f"📁 Сохраняем версию {new_manifest.build_id}…")
+        version_json = new_manifest.to_json().encode("utf-8")
+        dav.put(
+            self._rp(VERSIONS_DIR, f"{new_manifest.build_id}.json"),
+            version_json,
+            content_type="application/json",
+        )
+
+        self.log.emit("📝 Обновляем depot.json…")
+        depot_meta = self._build_depot_meta(new_manifest)
+        # storage_format — единственное различие в depot.json между двумя
+        # протоколами; читающая сторона (панель/будущий launcher-reader)
+        # смотрит на это поле, чтобы понять, брать ли чанк из chunks/<xx>/<id>
+        # или искать его в chunk_index.db + packs/.
+        depot_meta["storage_format"] = "packed"
+        dav.put(
+            self._rp(DEPOT_META),
+            json.dumps(depot_meta, ensure_ascii=False, indent=2).encode("utf-8"),
+            content_type="application/json",
+        )
+
+        self.log.emit("📤 Публикуем depot_manifest.json…")
+        manifest_json = new_manifest.to_json().encode("utf-8")
+        ok = dav.put(
+            self._rp("depot_manifest.json"),
+            manifest_json,
+            content_type="application/json",
+        )
+        if not ok:
+            return False, "Критическая ошибка: не удалось обновить depot_manifest.json"
+
+        msg = (
+            f"✅ Build #{new_manifest.build_number} опубликован (packed)! "
+            f"({new_manifest.build_id})  "
+            f"Новых чанков упаковано: {total}, "
+            f"новых/изменённых файлов: {delta.total_new_files}"
+        )
+        return True, msg
+
     @staticmethod
     def _build_depot_meta(m: DepotManifest) -> dict:
         return {
@@ -650,7 +797,13 @@ class DepotBuildWorker(ThreadSafeWorker):
                 if not sync.ensure_depot_structure():
                     self.finished.emit(False, "Не удалось создать структуру депо")
                     return
-                ok, msg = sync.execute_sync(
+                # use_packs — см. CLAUDE.md "Упаковка чанков в pack-файлы":
+                # публикует чанки как pack-файлы + chunk_index.db вместо
+                # chunks/<xx>/<id> по одному, старое поведение остаётся
+                # умолчанием (флаг выключен), пока читающая сторона
+                # (панель/лаунчер) не подтверждена рабочей.
+                sync_fn = sync.execute_sync_packed if sync.use_packs else sync.execute_sync
+                ok, msg = sync_fn(
                     new_manifest = self.confirmed_manifest,
                     delta        = self.confirmed_delta,
                     local_dir    = cfg.get("local_dir", ""),
