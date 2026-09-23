@@ -281,6 +281,66 @@ class ChunkManager(QObject):
 
         return entries, stats
 
+    # ── Сканирование НЕСКОЛЬКИХ компонентных папок в один манифест ───────────
+    # (Skyrim / MO2p / MO2ext — см. DepotTab в depot_tab.py и
+    # CLAUDE.md "Компонентная модель для Депо (chunks)"). Каждый компонент —
+    # свой корень на диске, свои excludes; в итоговом манифесте пути
+    # получают префикс "<Компонент>/", чтобы три дерева не пересекались и
+    # чтобы при появлении читающей стороны (будущий launcher-reader) было
+    # однозначно видно, из какого компонента взят файл.
+
+    def scan_components(
+        self,
+        components: Dict[str, dict],   # {name: {local_dir, included, excludes}}
+        prev_manifest: Optional["DepotManifest"] = None,
+    ) -> Tuple[Dict[str, FileEntry], "ScanStats", Dict[str, str]]:
+        """Возвращает (entries, суммарная ScanStats, {component: local_dir}
+        по факту включённых и заданных компонентов)."""
+        merged_entries: Dict[str, FileEntry] = {}
+        total_stats = ScanStats()
+        component_roots: Dict[str, str] = {}
+
+        prev_files = prev_manifest.files if prev_manifest else {}
+
+        for name, comp_cfg in components.items():
+            if not comp_cfg.get("included"):
+                continue
+            local_dir = (comp_cfg.get("local_dir") or "").strip()
+            if not local_dir:
+                continue
+            component_roots[name] = local_dir
+
+            prefix = f"{name}/"
+            comp_prev = {
+                p[len(prefix):]: e
+                for p, e in prev_files.items()
+                if p.startswith(prefix)
+            }
+            comp_prev_manifest = _PrevFilesSlice(comp_prev) if comp_prev else None
+
+            self.log.emit(f"📁 Компонент «{name}»: {local_dir}")
+            entries, stats = self.scan_directory(
+                local_dir     = Path(local_dir),
+                excludes      = comp_cfg.get("excludes", []),
+                prev_manifest = comp_prev_manifest,
+            )
+
+            for rel_path, entry in entries.items():
+                full_path = f"{name}/{rel_path}"
+                merged_entries[full_path] = FileEntry(
+                    path      = full_path,
+                    size      = entry.size,
+                    file_hash = entry.file_hash,
+                    chunks    = entry.chunks,
+                )
+
+            total_stats.total_files += stats.total_files
+            total_stats.processed   += stats.processed
+            total_stats.unchanged   += stats.unchanged
+            total_stats.errors      += stats.errors
+
+        return merged_entries, total_stats, component_roots
+
     # ── Верификация файла на клиенте ─────────────────────────────────────────
 
     def verify_file(self, file_path: Path, entry: FileEntry) -> Tuple[bool, str]:
@@ -384,6 +444,16 @@ class ScanStats:
             f"без изменений: {self.unchanged}, "
             f"ошибок: {self.errors}"
         )
+
+
+class _PrevFilesSlice:
+    """Лёгкая обёртка {files: dict} — scan_directory() читает только
+    prev_manifest.files, полноценный DepotManifest тут не нужен. Используется
+    scan_components() чтобы передать в scan_directory() только те записи
+    предыдущего манифеста, что относятся к ОДНОМУ компоненту (с уже
+    снятым префиксом "<Компонент>/")."""
+    def __init__(self, files: Dict[str, FileEntry]):
+        self.files = files
 
 
 # ── DepotManifest ─────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ mkcol() здесь — no-op (всегда True): панель создаёт р
 `_ensure_chunk_subdir`) не знал и не заботился, какой транспорт активен.
 """
 import time
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import requests
 
@@ -146,6 +146,61 @@ class PanelHTTP:
             return False, f"Таймаут подключения ({TIMEOUT_CONNECT}s)"
         except Exception as e:
             return False, str(e)
+
+    # ── Проекты / файлы (для GUI: серверный список проектов и вкладка
+    #    "Файлы на сервере" — см. TESL-Panel::panel/app.py /api/projects и
+    #    /api/depot/<project>/files, добавленные 2026-09-23 именно под эту
+    #    нужду) ──────────────────────────────────────────────────────────────
+
+    def list_projects(self) -> List[str]:
+        try:
+            r = self.session.get(f"{self.base_url}/api/projects", timeout=TIMEOUT_CONNECT)
+            self.last_response = r
+            if r.status_code != 200:
+                return []
+            return list(r.json().get("projects", []))
+        except Exception:
+            return []
+
+    def create_project(self, name: str) -> Tuple[bool, str]:
+        try:
+            r = self.session.post(
+                f"{self.base_url}/api/projects", json={"name": name}, timeout=TIMEOUT_CONNECT,
+            )
+            self.last_response = r
+            if r.status_code == 201:
+                return True, "Проект создан"
+            if r.status_code == 401:
+                return False, "Неверный upload-токен"
+            try:
+                return False, r.json().get("description", f"HTTP {r.status_code}")
+            except Exception:
+                return False, f"HTTP {r.status_code}"
+        except Exception as e:
+            return False, str(e)
+
+    def list_files(self, project: Optional[str] = None) -> Optional[List[dict]]:
+        """[{"path": ..., "size": ...}, ...] для проекта — если project не
+        задан, используется self.project (см. __init__)."""
+        proj = project or self.project
+        try:
+            r = self.session.get(
+                f"{self.base_url}/api/depot/{proj}/files", timeout=TIMEOUT_GET,
+            )
+            self.last_response = r
+            if r.status_code != 200:
+                return None
+            return list(r.json().get("files", []))
+        except Exception:
+            return None
+
+    def delete_object(self, path: str) -> bool:
+        try:
+            r = self._retry(self.session.delete, self._url(path), timeout=TIMEOUT_CONNECT)
+            self.last_response = r
+            return r.status_code == 200
+        except Exception:
+            return False
 
     def close(self):
         self.session.close()

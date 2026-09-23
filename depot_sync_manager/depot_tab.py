@@ -3,32 +3,52 @@
 Вкладка "Депо" для main_window — публикация через chunk-протокол
 (chunks/<xx>/<id> или, с 2026-09-23, упакованные pack-файлы, см.
 pack_writer.py) — независимо от старого компонентного протокола
-(ReleaseTab), свой backend (WebDAV ИЛИ TESL-Panel, см. panel_client.py)
-и своя локальная папка (НЕ переиспользует components из ReleaseTab —
-это другой протокол публикации, привязывать их друг к другу смысла
-нет: можно публиковать одну и ту же папку и старым, и новым способом
-независимо).
+(ReleaseTab), свой backend (WebDAV ИЛИ TESL-Panel, см. panel_client.py).
+
+Компонентная модель (2026-09-23, второй заход) — та же тройка Skyrim/
+MO2p/MO2ext, что уже была в ReleaseTab (config.py::COMPONENT_NAMES),
+только теперь ЗДЕСЬ тоже: три независимых локальных папки, у каждой
+свой чекбокс "включить" и свои файловые исключения (переиспользует
+ComponentRow/ExcludesDialog из release_tab.py — тот же UI-паттерн, не
+две разные реализации одного и того же). Раньше вкладка сканировала
+ОДНУ папку целиком — этого не хватало ровно для того же кейса, ради
+которого компоненты вообще появились в ReleaseTab: MO2 и папка модов
+иногда лежат раздельно (MO2ext), и нужно исключать отдельные файлы из
+каждой части независимо. Сохраняется в config[CFG_KEY]["components"] —
+своя копия, НЕ переиспользует cfg["components"] от ReleaseTab (можно
+публиковать одну и ту же папку и старым, и новым протоколом с разными
+наборами исключений, привязывать их друг к другу смысла нет).
+
+Project теперь читается С СЕРВЕРА (GET /api/projects, см. panel_client.
+py::list_projects()) вместо ручного ввода строки — плюс кнопка "Новый
+проект" (POST /api/projects). App ID/Depot ID как отдельные поля
+убраны — App ID теперь равен имени проекта (одно и то же понятие было
+представлено двумя полями), Depot ID зафиксирован в 1 (в этой схеме на
+проект всегда один депот).
 
 Подключается в main_window.py:
     self.depot_tab = DepotTab(self)
     self.depot_tab.log_message.connect(self.log_message)
     self.tabs.addTab(self.depot_tab, "📦 Депо (chunks)")
 """
-import json
 from pathlib import Path
+from typing import Dict
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QComboBox, QLineEdit, QSpinBox, QFormLayout,
-    QProgressBar, QTextEdit, QCheckBox, QSizePolicy, QFrame,
-    QMessageBox, QFileDialog, QStackedWidget,
+    QProgressBar, QTextEdit, QCheckBox, QMessageBox, QStackedWidget,
+    QInputDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from chunk_manager import DEFAULT_CHUNK_SIZE, DepotManifest, DepotDelta
 from depot_sync_manager import DepotBuildWorker, DepotSyncManager
 from pack_writer import DEFAULT_PACK_SIZE
 from depot_confirm_dialog import DepotConfirmDialog
+from release_tab import ComponentRow
+from config import COMPONENT_NAMES, DEFAULT_COMPONENTS_CONFIG
 
 
 def _fmt_size(n: int) -> str:
@@ -51,8 +71,8 @@ CHUNK_SIZES = [
 
 CHANNELS = ["stable", "beta", "dev"]
 
-# "depot" — отдельный ключ в конфиге (независим от "webdav"/"components",
-# которыми пользуется ReleaseTab) — своя локальная папка, свой backend.
+# "depot_tab" — отдельный ключ в конфиге (независим от "webdav"/"components",
+# которыми пользуется ReleaseTab) — своя компонентная тройка, свой backend.
 CFG_KEY = "depot_tab"
 
 
@@ -69,6 +89,7 @@ class DepotTab(QWidget):
         self._btn_pause_state = False
         self._pending_manifest: DepotManifest = None
         self._pending_delta:    DepotDelta = None
+        self._comp_rows: Dict[str, ComponentRow] = {}
         self._init_ui()
         self._load_settings()
 
@@ -78,16 +99,27 @@ class DepotTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        # ── Локальная папка ──────────────────────────────────────────────────
-        dir_box = QGroupBox("Локальная папка")
-        dir_row = QHBoxLayout(dir_box)
-        self.local_dir_edit = QLineEdit()
-        self.local_dir_edit.setPlaceholderText(r"P:\Games\skyrim\Skyrim")
-        dir_row.addWidget(self.local_dir_edit)
-        btn_browse = QPushButton("Обзор…")
-        btn_browse.clicked.connect(self._browse_folder)
-        dir_row.addWidget(btn_browse)
-        root.addWidget(dir_box)
+        # ── Компоненты сборки (Skyrim / MO2p / MO2ext) ──────────────────────
+        comp_box = QGroupBox("Компоненты сборки")
+        comp_layout = QVBoxLayout(comp_box)
+        comp_layout.setSpacing(4)
+
+        comp_hint = QLabel(
+            "Skyrim и MO2 обычно в одной папке — тогда достаточно заполнить\n"
+            "«Skyrim» и оставить «MO2ext» пропущенным. Если MO2 и папка модов\n"
+            "лежат раздельно — включите «MO2ext» и укажите её отдельно."
+        )
+        comp_hint.setStyleSheet("font-size: 9pt; color: #888;")
+        comp_layout.addWidget(comp_hint)
+
+        saved_components = self._get_config().get(CFG_KEY, {}).get("components", {})
+        for comp_name in COMPONENT_NAMES:
+            comp_cfg = saved_components.get(comp_name, DEFAULT_COMPONENTS_CONFIG.get(comp_name, {}))
+            row = ComponentRow(comp_name, comp_cfg)
+            self._comp_rows[comp_name] = row
+            comp_layout.addWidget(row)
+
+        root.addWidget(comp_box)
 
         # ── Куда публикуем ────────────────────────────────────────────────────
         backend_box = QGroupBox("Куда публикуем")
@@ -105,12 +137,26 @@ class DepotTab(QWidget):
         panel_form = QFormLayout(panel_page)
         self.panel_url_edit = QLineEdit()
         self.panel_url_edit.setPlaceholderText("https://tesl-panel.neth.de5.net")
-        self.panel_project_edit = QLineEdit()
-        self.panel_project_edit.setPlaceholderText("TESVAE")
+        panel_form.addRow("URL панели:", self.panel_url_edit)
+
+        proj_row = QHBoxLayout()
+        self.panel_project_combo = QComboBox()
+        self.panel_project_combo.setEditable(False)
+        self.panel_project_combo.setMinimumWidth(160)
+        proj_row.addWidget(self.panel_project_combo, stretch=1)
+        btn_refresh_proj = QPushButton("🔄")
+        btn_refresh_proj.setFixedWidth(32)
+        btn_refresh_proj.setToolTip("Обновить список проектов с сервера")
+        btn_refresh_proj.clicked.connect(self._refresh_projects)
+        proj_row.addWidget(btn_refresh_proj)
+        btn_new_proj = QPushButton("➕ Новый")
+        btn_new_proj.setToolTip("Создать новый проект на панели")
+        btn_new_proj.clicked.connect(self._create_new_project)
+        proj_row.addWidget(btn_new_proj)
+        panel_form.addRow("Проект:", proj_row)
+
         self.panel_token_edit = QLineEdit()
         self.panel_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        panel_form.addRow("URL панели:", self.panel_url_edit)
-        panel_form.addRow("Проект:", self.panel_project_edit)
         panel_form.addRow("Upload-токен:", self.panel_token_edit)
         self.backend_stack.addWidget(panel_page)
 
@@ -143,22 +189,13 @@ class DepotTab(QWidget):
         settings_box = QGroupBox("Настройки депо")
         form = QFormLayout(settings_box)
 
-        self.app_id_edit = QLineEdit()
-        self.app_id_edit.setPlaceholderText("skyrim-001")
-        form.addRow("App ID:", self.app_id_edit)
-
-        self.depot_id_spin = QSpinBox()
-        self.depot_id_spin.setRange(1, 99999)
-        self.depot_id_spin.setValue(1001)
-        form.addRow("Depot ID:", self.depot_id_spin)
-
         self.channel_combo = QComboBox()
         self.channel_combo.addItems(CHANNELS)
         form.addRow("Канал:", self.channel_combo)
 
         self.chunk_combo = QComboBox()
         default_idx = 2  # 4 MB
-        for i, (label, _) in enumerate(CHUNK_SIZES):
+        for label, _ in CHUNK_SIZES:
             self.chunk_combo.addItem(label)
         self.chunk_combo.setCurrentIndex(default_idx)
         form.addRow("Размер чанка:", self.chunk_combo)
@@ -208,8 +245,9 @@ class DepotTab(QWidget):
         actions_inner = QVBoxLayout(actions_box)
 
         desc = QLabel(
-            "Сканирует локальную папку, вычисляет delta относительно сервера,\n"
-            "загружает только изменившиеся чанки. Чанки дедуплицируются."
+            "Сканирует включённые компоненты, вычисляет delta относительно сервера,\n"
+            "загружает только изменившиеся чанки. Чанки дедуплицируются. "
+            "Номер сборки на канале присваивается автоматически."
         )
         desc.setWordWrap(True)
         actions_inner.addWidget(desc)
@@ -250,7 +288,7 @@ class DepotTab(QWidget):
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setFont(QFont("Consolas", 9))
-        self.log_edit.setMaximumHeight(220)
+        self.log_edit.setMaximumHeight(180)
         log_inner.addWidget(self.log_edit)
 
         btn_clear = QPushButton("🗑 Очистить")
@@ -260,16 +298,66 @@ class DepotTab(QWidget):
 
         root.addStretch()
 
-    def _browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку для публикации")
-        if folder:
-            self.local_dir_edit.setText(folder)
+    def showEvent(self, event):
+        super().showEvent(event)
+        if (self.backend_combo.currentIndex() == 0
+                and self.panel_project_combo.count() == 0
+                and self.panel_url_edit.text().strip()):
+            self._refresh_projects()
 
     def _on_backend_changed(self, idx: int):
         self.backend_stack.setCurrentIndex(idx)
 
     def _on_use_packs_changed(self, state):
         self.pack_size_spin.setEnabled(self.use_packs_check.isChecked())
+
+    # ── Projects (server-driven) ────────────────────────────────────────────
+
+    def _refresh_projects(self):
+        base_url = self.panel_url_edit.text().strip().rstrip("/")
+        if not base_url:
+            QMessageBox.warning(self, "Ошибка", "Заполните URL панели!")
+            return
+        from panel_client import PanelHTTP
+        client = PanelHTTP(base_url=base_url, project="", token=self.panel_token_edit.text())
+        names = client.list_projects()
+        client.close()
+        current = self.panel_project_combo.currentText()
+        self.panel_project_combo.clear()
+        self.panel_project_combo.addItems(names)
+        if current:
+            idx = self.panel_project_combo.findText(current)
+            if idx >= 0:
+                self.panel_project_combo.setCurrentIndex(idx)
+        self._log(f"📋 Проектов на панели: {len(names)}")
+
+    def _create_new_project(self):
+        base_url = self.panel_url_edit.text().strip().rstrip("/")
+        token = self.panel_token_edit.text()
+        if not base_url or not token:
+            QMessageBox.warning(self, "Ошибка", "Заполните URL панели и upload-токен!")
+            return
+        name, ok = QInputDialog.getText(self, "Новый проект", "Имя проекта (буквы/цифры/_/-):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        from panel_client import PanelHTTP
+        client = PanelHTTP(base_url=base_url, project="", token=token)
+        created, msg = client.create_project(name)
+        client.close()
+        if created:
+            self._log(f"✅ Проект создан: {name}")
+            self._refresh_projects()
+            idx = self.panel_project_combo.findText(name)
+            if idx >= 0:
+                self.panel_project_combo.setCurrentIndex(idx)
+        else:
+            QMessageBox.warning(self, "Ошибка", msg)
+
+    # ── Components helpers ───────────────────────────────────────────────────
+
+    def _get_components_cfg(self) -> Dict:
+        return {name: row.get_config() for name, row in self._comp_rows.items()}
 
     # ── Settings persistence ──────────────────────────────────────────────────
     # Отдельная секция конфига (CFG_KEY) — независима от "webdav"/
@@ -281,14 +369,16 @@ class DepotTab(QWidget):
     def _load_settings(self):
         cfg = self._get_config().get(CFG_KEY, {})
 
-        self.local_dir_edit.setText(cfg.get("local_dir", ""))
         self.backend_combo.setCurrentIndex(0 if cfg.get("backend", "panel") == "panel" else 1)
         self.backend_stack.setCurrentIndex(self.backend_combo.currentIndex())
 
         panel = cfg.get("panel", {})
         self.panel_url_edit.setText(panel.get("base_url", ""))
-        self.panel_project_edit.setText(panel.get("project", ""))
         self.panel_token_edit.setText(panel.get("token", ""))
+        saved_project = panel.get("project", "")
+        if saved_project:
+            self.panel_project_combo.addItem(saved_project)
+            self.panel_project_combo.setCurrentIndex(0)
 
         webdav = cfg.get("webdav", {})
         self.webdav_url_edit.setText(webdav.get("server_url", ""))
@@ -298,8 +388,6 @@ class DepotTab(QWidget):
         self.webdav_ssl_check.setChecked(webdav.get("verify_ssl", True))
 
         depot = cfg.get("depot", {})
-        self.app_id_edit.setText(depot.get("app_id", "my_app"))
-        self.depot_id_spin.setValue(depot.get("depot_id", 1001))
         ch = depot.get("channel", "stable")
         idx = self.channel_combo.findText(ch)
         if idx >= 0:
@@ -316,15 +404,18 @@ class DepotTab(QWidget):
 
     def _build_runtime_config(self) -> dict:
         """Собирает config-словарь ровно в форме, которую ожидает
-        DepotSyncManager (backend/panel/webdav/use_packs/depot/local_dir/
-        excludes) — та же схема, что publish_packed.py собирал вручную."""
+        DepotSyncManager/DepotBuildWorker (backend/panel/webdav/use_packs/
+        depot/components). App ID больше не отдельное поле — равен имени
+        проекта (то же понятие, две формы ввода не нужны). Depot ID
+        зафиксирован — на проект всегда один депот в этой схеме."""
         backend = "panel" if self.backend_combo.currentIndex() == 0 else "webdav"
+        project = self.panel_project_combo.currentText().strip()
         return {
             "backend": backend,
             "use_packs": self.use_packs_check.isChecked(),
             "panel": {
                 "base_url": self.panel_url_edit.text().strip().rstrip("/"),
-                "project":  self.panel_project_edit.text().strip(),
+                "project":  project,
                 "token":    self.panel_token_edit.text(),
                 "verify_ssl": True,
             },
@@ -336,14 +427,13 @@ class DepotTab(QWidget):
                 "verify_ssl":  self.webdav_ssl_check.isChecked(),
             },
             "depot": {
-                "app_id":     self.app_id_edit.text().strip() or "my_app",
-                "depot_id":   self.depot_id_spin.value(),
+                "app_id":     project or "app",
+                "depot_id":   1,
                 "channel":    self.channel_combo.currentText(),
                 "chunk_size": CHUNK_SIZES[self.chunk_combo.currentIndex()][1],
                 "pack_size":  self.pack_size_spin.value() * 1024 * 1024,
             },
-            "local_dir": self.local_dir_edit.text().strip(),
-            "excludes": [],
+            "components": self._get_components_cfg(),
         }
 
     def _save_settings(self):
@@ -360,10 +450,23 @@ class DepotTab(QWidget):
         для сетевого запроса."""
         if cfg["backend"] == "panel":
             if not cfg["panel"]["base_url"] or not cfg["panel"]["project"]:
-                return "Заполните URL панели и имя проекта!"
+                return "Заполните URL панели и выберите проект!"
         else:
             if not cfg["webdav"]["server_url"]:
                 return "Заполните URL WebDAV сервера!"
+        return ""
+
+    def _validate_components(self, cfg: dict) -> str:
+        included = [n for n, c in cfg["components"].items() if c.get("included")]
+        if not included:
+            return "Включите хотя бы один компонент (Skyrim/MO2p/MO2ext)!"
+        missing = [n for n in included if not cfg["components"][n].get("local_dir")]
+        if missing:
+            return f"Не задан путь для компонентов: {', '.join(missing)}"
+        for n in included:
+            local_dir = cfg["components"][n]["local_dir"]
+            if not Path(local_dir).is_dir():
+                return f"Папка не найдена ({n}): {local_dir}"
         return ""
 
     def _test_connection(self):
@@ -401,24 +504,23 @@ class DepotTab(QWidget):
                 f"  Канал: {manifest.channel}\n"
                 f"  Файлов: {len(manifest.files)}\n"
                 f"  Размер: {manifest.human_size()}\n"
-                f"  Создан: {manifest.created_at[:19]}"
+                f"  Создан: {manifest.created_at[:19]}\n"
+                f"  Следующая сборка получит номер #{manifest.build_number + 1}"
             )
             self.server_status_label.setText(info)
             self._log(f"✅ Манифест получен: {manifest.version_label()}")
         else:
             self.server_status_label.setText("⚠️ Манифест не найден (первая публикация?)")
-            self._log("⚠️ Манифест на сервере не найден")
+            self._log("⚠️ Манифест на сервере не найден — следующая сборка получит номер #1")
 
     # ── Build & publish ───────────────────────────────────────────────────────
 
     def _start_build(self):
         """Запуск фазы сканирования. После — показ диалога подтверждения."""
         cfg = self._build_runtime_config()
-        if not cfg["local_dir"]:
-            QMessageBox.warning(self, "Ошибка", "Выберите локальную папку!")
-            return
-        if not Path(cfg["local_dir"]).is_dir():
-            QMessageBox.warning(self, "Ошибка", f"Папка не найдена: {cfg['local_dir']}")
+        err = self._validate_components(cfg)
+        if err:
+            QMessageBox.warning(self, "Ошибка", err)
             return
         err = self._validate_backend(cfg)
         if err:
@@ -538,6 +640,8 @@ class DepotTab(QWidget):
         self.btn_pause.setEnabled(busy)
         self.btn_stop.setEnabled(busy)
         self._btn_pause_state = False
+        for row in self._comp_rows.values():
+            row.setEnabled(not busy)
         if busy:
             self.btn_publish.setText("⏳ Работает...")
         else:

@@ -501,13 +501,25 @@ class DepotSyncManager(QObject):
         ok   = dav.put(path, data)
         return chunk_id, ok
 
+    # ── Разрешение локального пути чанка: одна папка (str, старый CLI-путь,
+    #    см. publish_packed.py) ИЛИ несколько компонентных папок (dict
+    #    {component: local_dir}, см. DepotTab/chunk_manager.scan_components) —
+    #    во втором случае rel_path всегда имеет вид "<Компонент>/<путь>".
+
+    @staticmethod
+    def _resolve_source_path(local_dir, rel_path: str) -> Path:
+        if isinstance(local_dir, dict):
+            comp, _, sub_rel = rel_path.partition("/")
+            return Path(local_dir.get(comp, "")) / sub_rel
+        return Path(local_dir) / rel_path
+
     # ── Execute sync ──────────────────────────────────────────────────────────
 
     def execute_sync(
         self,
         new_manifest:  DepotManifest,
         delta:         DepotDelta,
-        local_dir:     str,
+        local_dir,     # str (одна папка) ИЛИ dict {component: local_dir}
         stop_fn=None,
         pause_fn=None,
     ) -> Tuple[bool, str]:
@@ -531,7 +543,7 @@ class DepotSyncManager(QObject):
                     return chunk_id, False, 0
                 rel_path, offset, size = src
                 try:
-                    fp = Path(local_dir) / rel_path
+                    fp = self._resolve_source_path(local_dir, rel_path)
                     with open(fp, "rb") as f:
                         f.seek(offset)
                         data = f.read(size)
@@ -613,7 +625,7 @@ class DepotSyncManager(QObject):
         self,
         new_manifest:  DepotManifest,
         delta:         DepotDelta,
-        local_dir:     str,
+        local_dir,     # str (одна папка) ИЛИ dict {component: local_dir}
         stop_fn=None,
         pause_fn=None,
     ) -> Tuple[bool, str]:
@@ -662,7 +674,7 @@ class DepotSyncManager(QObject):
                         continue
                     rel_path, offset, size = src
                     try:
-                        fp = Path(local_dir) / rel_path
+                        fp = self._resolve_source_path(local_dir, rel_path)
                         with open(fp, "rb") as f:
                             f.seek(offset)
                             data = f.read(size)
@@ -803,10 +815,22 @@ class DepotBuildWorker(ThreadSafeWorker):
                 # умолчанием (флаг выключен), пока читающая сторона
                 # (панель/лаунчер) не подтверждена рабочей.
                 sync_fn = sync.execute_sync_packed if sync.use_packs else sync.execute_sync
+                # components (dict {name: {local_dir, included, excludes}}) —
+                # актуальный путь через DepotTab (Skyrim/MO2p/MO2ext, см.
+                # CLAUDE.md "Компонентная модель для Депо (chunks)").
+                # local_dir (строка) — старый однопапочный путь, оставлен
+                # ради publish_packed.py (CLI без GUI) и обратной
+                # совместимости уже сохранённых конфигов.
+                components = cfg.get("components")
+                source = (
+                    {name: c["local_dir"] for name, c in components.items()
+                     if c.get("included") and c.get("local_dir")}
+                    if components else cfg.get("local_dir", "")
+                )
                 ok, msg = sync_fn(
                     new_manifest = self.confirmed_manifest,
                     delta        = self.confirmed_delta,
-                    local_dir    = cfg.get("local_dir", ""),
+                    local_dir    = source,
                     stop_fn      = self._should_stop,
                     pause_fn     = self._wait_if_paused,
                 )
@@ -834,15 +858,31 @@ class DepotBuildWorker(ThreadSafeWorker):
 
             remote_chunks = sync.fetch_remote_chunk_ids(prev_manifest)
 
-            local_dir = cfg.get("local_dir", "")
-            excludes  = cfg.get("excludes", [])
-            self.log.emit(f"📁 Сканируем: {local_dir}")
-
-            entries, stats = cm.scan_directory(
-                local_dir     = Path(local_dir),
-                excludes      = excludes,
-                prev_manifest = prev_manifest,
-            )
+            components = cfg.get("components")
+            if components:
+                comp_summary = ", ".join(
+                    f"{n}: {c['local_dir']}" for n, c in components.items()
+                    if c.get("included") and c.get("local_dir")
+                )
+                self.log.emit(f"📁 Сканируем компоненты: {comp_summary}")
+                entries, stats, component_roots = cm.scan_components(
+                    components    = components,
+                    prev_manifest = prev_manifest,
+                )
+                excludes  = []   # исключения теперь per-компонент, не общие
+                local_dir_display = ", ".join(component_roots.values())
+            else:
+                # Старый однопапочный путь — оставлен ради publish_packed.py
+                # (CLI без GUI) и уже сохранённых конфигов без "components".
+                local_dir = cfg.get("local_dir", "")
+                excludes  = cfg.get("excludes", [])
+                self.log.emit(f"📁 Сканируем: {local_dir}")
+                entries, stats = cm.scan_directory(
+                    local_dir     = Path(local_dir),
+                    excludes      = excludes,
+                    prev_manifest = prev_manifest,
+                )
+                local_dir_display = local_dir
 
             if not entries:
                 self.finished.emit(False, "Нет файлов для загрузки")
@@ -860,7 +900,7 @@ class DepotBuildWorker(ThreadSafeWorker):
             )
             new_manifest.files     = entries
             new_manifest.excludes  = excludes
-            new_manifest.local_dir = local_dir
+            new_manifest.local_dir = local_dir_display
 
             prev_entries = prev_manifest.files if prev_manifest else {}
             delta = cm.compute_delta(entries, prev_entries, remote_chunks)

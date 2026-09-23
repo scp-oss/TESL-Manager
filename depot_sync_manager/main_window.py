@@ -170,6 +170,16 @@ class MainWindow(QMainWindow):
         self.depot_tab.log_message.connect(self.log_message)
         self.tabs.addTab(self.depot_tab, "📦 Депо (chunks)")
 
+        # Отдельная вкладка для просмотра/редактирования/добавления уже
+        # опубликованных на TESL-Panel файлов (Bearer, см. её собственный
+        # CLAUDE.md /api/projects, /api/depot/<project>/files) — десктоп-
+        # эквивалент панельского /admin/project/<name>/files, независимый
+        # от sever_files_tab.py (тот — для WebDAV/PROPFIND).
+        from depot_files_tab import DepotFilesTab
+        self.depot_files_tab = DepotFilesTab(self)
+        self.depot_files_tab.log_message.connect(self.log_message)
+        self.tabs.addTab(self.depot_files_tab, "🗂️ Файлы на депо")
+
         self.tabs.addTab(self._build_settings_tab(), "⚙️ Настройки")
         self.tabs.addTab(self._build_log_tab(), "📝 Лог")
 
