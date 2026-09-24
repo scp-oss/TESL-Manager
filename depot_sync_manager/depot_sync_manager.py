@@ -70,6 +70,41 @@ UPLOAD_WORKERS_PACKS_SSD = 4
 DAV_NS = "{DAV:}"
 
 
+# Живой инцидент (2026-09-24): пауза сервиса на сервере ровно в момент
+# заливки (`sudo systemctl stop tesl-panel.service` во время деплоя,
+# сделанного одновременно с текущей публикацией) дала честный, но
+# фатальный для клиента 502 от nginx — nginx сам жив, апстрима за ним
+# нет — вся публикация оборвалась на pack-00015.bin, пользователю
+# оставалось начинать заново. Встроенный NextcloudDAV/PanelHTTP._retry()
+# лечит только СЫРЫЕ сетевые исключения requests (обрыв соединения/
+# таймаут), коротким окном (~11с суммарно, RETRY_BACKOFF) — реальный
+# HTTP-ответ 502/503/504 (сервис отвечает, апстрима нет/перегружен)
+# requests вообще не считает исключением, значит там не ретраится
+# вовсе. is_transient_last_error()/DepotSyncManager._retry_until_recovered()
+# ниже — дополнительный, куда более терпеливый слой ПОВЕРХ put()/
+# put_file(): если конкретная попытка похожа на "сервер временно
+# недоступен" — публикация не проваливается, а ждёт с бэкоффом и
+# повторяет САМ ЭТОТ файл (не всю публикацию с начала), пока не
+# восстановится или пользователь не нажмёт "Стоп". Всё остальное
+# (401/403/400/404/413 и т.п. — настоящая, не временная проблема)
+# по-прежнему проваливает публикацию сразу же, как и раньше — бесконечно
+# ждать восстановления там смысла нет.
+_TRANSIENT_STATUS_CODES = {502, 503, 504}
+_TRANSIENT_EXC_PREFIXES = ("ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout")
+
+
+def _is_transient_last_error(last_error: str) -> bool:
+    if not last_error:
+        return False
+    if last_error.startswith("HTTP "):
+        try:
+            code = int(last_error.split(":", 1)[0].split()[1])
+        except (IndexError, ValueError):
+            return False
+        return code in _TRANSIENT_STATUS_CODES
+    return last_error.startswith(_TRANSIENT_EXC_PREFIXES)
+
+
 def _fmt_eta(seconds: float) -> str:
     """Тот же формат, что у TESL (лаунчер, core/chunk_installer.py::
     _fmt_eta) — прямой запрос пользователя "добавь прогресс бар с данными
@@ -570,6 +605,51 @@ class DepotSyncManager(QObject):
             return Path(local_dir.get(comp, "")) / sub_rel
         return Path(local_dir) / rel_path
 
+    # ── Пауза + повтор при временной недоступности сервера (2026-09-24) ────────
+    # См. докстринг _is_transient_last_error() выше за полную картину живого
+    # инцидента, который это лечит. Используется только в execute_sync_packed()
+    # (активный, реально используемый путь публикации — use_packs=True по
+    # умолчанию) — легаси per-chunk execute_sync() этим не покрыт, см.
+    # CLAUDE.md за явную оговорку, почему это осознанно оставлено вне
+    # объёма этого захода.
+
+    def _retry_until_recovered(self, attempt_fn, dav: "NextcloudDAV", stop_fn, label: str) -> bool:
+        """attempt_fn() — вызывает РОВНО одну попытку put()/put_file() и
+        возвращает её bool-результат; к этому моменту dav.last_error уже
+        выставлен (put()/put_file() и так это делают на каждый вызов).
+        Не транзиентная ошибка — возвращает False сразу же, без единой
+        паузы, как и раньше. Транзиентная — ждёт с растущим (до потолка
+        30с) интервалом и повторяет САМ ЭТОТ файл, проверяя stop_fn()
+        каждую секунду ожидания (чтобы "Стоп" оставался отзывчивым, а не
+        блокировался на весь интервал разом), пока либо не получится,
+        либо пользователь не остановит, либо ошибка не окажется уже НЕ
+        транзиентной (например, токен успели сменить, пока ждали)."""
+        attempt = 0
+        while True:
+            ok = attempt_fn()
+            if ok:
+                if attempt > 0:
+                    self.log.emit(f"▶ Соединение восстановлено, продолжаем ({label})")
+                return True
+            if not _is_transient_last_error(dav.last_error):
+                return False
+            attempt += 1
+            wait_s = min(5 * attempt, 30)
+            if attempt == 1:
+                self.log.emit(
+                    f"⏸ Панель недоступна ({dav.last_error}) — "
+                    f"пауза, жду восстановления ({label})…"
+                )
+            elif attempt % 6 == 0:
+                self.log.emit(f"⏸ Всё ещё жду панель ({label}), попытка #{attempt}…")
+            waited = 0
+            while waited < wait_s:
+                if stop_fn and stop_fn():
+                    self.log.emit("⏹ Остановлено пользователем во время ожидания восстановления")
+                    return False
+                time.sleep(1)
+                waited += 1
+
     # ── Execute sync ──────────────────────────────────────────────────────────
 
     def execute_sync(
@@ -850,7 +930,10 @@ class DepotSyncManager(QObject):
                     # last_error снаружи, к этому моменту его может уже
                     # перезаписать ДРУГОЙ, ещё выполняющийся future.
                     def _upload_one_pack(pp: Path) -> Tuple[str, bool, int, str]:
-                        ok = dav.put_file(self._rp(PACKS_DIR, pp.name), pp)
+                        ok = self._retry_until_recovered(
+                            lambda: dav.put_file(self._rp(PACKS_DIR, pp.name), pp),
+                            dav, stop_fn, pp.name,
+                        )
                         return pp.name, ok, pp.stat().st_size, dav.last_error
 
                     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS_PACKS_SSD) as pool:
@@ -874,7 +957,10 @@ class DepotSyncManager(QObject):
                     for pack_path in pw.pack_paths:
                         if stop_fn and stop_fn():
                             return False, "Остановлено пользователем"
-                        ok = dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path)
+                        ok = self._retry_until_recovered(
+                            lambda: dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path),
+                            dav, stop_fn, pack_path.name,
+                        )
                         if not ok:
                             return False, f"Не удалось загрузить {pack_path.name}: {dav.last_error or 'см. лог'}"
                         pack_size = pack_path.stat().st_size
@@ -885,7 +971,10 @@ class DepotSyncManager(QObject):
                 merged = {**existing_index, **pw.locations}
                 index_path = pack_dir / CHUNK_INDEX_NAME
                 write_chunk_index_db(index_path, merged)
-                ok = dav.put_file(self._rp(CHUNK_INDEX_NAME), index_path)
+                ok = self._retry_until_recovered(
+                    lambda: dav.put_file(self._rp(CHUNK_INDEX_NAME), index_path),
+                    dav, stop_fn, "chunk_index.db",
+                )
                 if not ok:
                     return False, f"Не удалось загрузить chunk_index.db: {dav.last_error or 'см. лог'}"
                 self.log.emit(f"📋 chunk_index.db обновлён: {len(merged)} чанков всего")
@@ -896,10 +985,13 @@ class DepotSyncManager(QObject):
 
         self.log.emit(f"📁 Сохраняем версию {new_manifest.build_id}…")
         version_json = new_manifest.to_json().encode("utf-8")
-        dav.put(
-            self._rp(VERSIONS_DIR, f"{new_manifest.build_id}.json"),
-            version_json,
-            content_type="application/json",
+        self._retry_until_recovered(
+            lambda: dav.put(
+                self._rp(VERSIONS_DIR, f"{new_manifest.build_id}.json"),
+                version_json,
+                content_type="application/json",
+            ),
+            dav, stop_fn, f"{new_manifest.build_id}.json",
         )
 
         self.log.emit("📝 Обновляем depot.json…")
@@ -909,18 +1001,24 @@ class DepotSyncManager(QObject):
         # смотрит на это поле, чтобы понять, брать ли чанк из chunks/<xx>/<id>
         # или искать его в chunk_index.db + packs/.
         depot_meta["storage_format"] = "packed"
-        dav.put(
-            self._rp(DEPOT_META),
-            json.dumps(depot_meta, ensure_ascii=False, indent=2).encode("utf-8"),
-            content_type="application/json",
+        self._retry_until_recovered(
+            lambda: dav.put(
+                self._rp(DEPOT_META),
+                json.dumps(depot_meta, ensure_ascii=False, indent=2).encode("utf-8"),
+                content_type="application/json",
+            ),
+            dav, stop_fn, "depot.json",
         )
 
         self.log.emit("📤 Публикуем depot_manifest.json…")
         manifest_json = new_manifest.to_json().encode("utf-8")
-        ok = dav.put(
-            self._rp("depot_manifest.json"),
-            manifest_json,
-            content_type="application/json",
+        ok = self._retry_until_recovered(
+            lambda: dav.put(
+                self._rp("depot_manifest.json"),
+                manifest_json,
+                content_type="application/json",
+            ),
+            dav, stop_fn, "depot_manifest.json",
         )
         if not ok:
             return False, f"Критическая ошибка: не удалось обновить depot_manifest.json: {dav.last_error or 'см. лог'}"
