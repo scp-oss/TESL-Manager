@@ -35,7 +35,6 @@ from PyQt6.QtCore import pyqtSignal, QTimer
 
 from config import DEFAULT_COMPONENTS_CONFIG, COMPONENT_NAMES, get_window_title, LOG_FILE
 from chunk_manager import DEFAULT_CHUNK_SIZE
-from pack_writer import DEFAULT_PACK_SIZE
 from file_selector import FileSelector
 from manifest_manager import ManifestManager
 from themes import ThemeManager
@@ -137,6 +136,16 @@ class MainWindow(QMainWindow):
         self.manifest_manager = ManifestManager(self.config)
         self._log_lines       = []   # полная (нефильтрованная) история лога, см. _build_log_tab()
         self._migrate_legacy_backend_config()
+        # Сохраняем сразу же — миграция(и) выше (включая безусловную чистку
+        # устаревшего depot_publish["pack_size"], см. её собственный
+        # комментарий) должны попасть на диск немедленно, а не только при
+        # следующем "естественном" save_config() где-то по ходу работы —
+        # иначе, если пользователь закроет приложение до первого save
+        # (например сразу после старта, ничего не меняя), устаревшее
+        # значение переживёт перезапуск и снова победит автовывод по
+        # disk_mode на следующей публикации. Дешёвая идемпотентная запись,
+        # безопасно на каждом старте.
+        self.file_selector.save_config()
 
         # Дебаг-режим (2026-09-23, прямой запрос) — один timestamp на весь
         # сеанс работы приложения: периодическая отправка лога в панель
@@ -176,7 +185,6 @@ class MainWindow(QMainWindow):
                 cfg["depot_publish"] = {
                     "use_packs":  old.get("use_packs", True),
                     "chunk_size": d.get("chunk_size", DEFAULT_CHUNK_SIZE),
-                    "pack_size":  d.get("pack_size", DEFAULT_PACK_SIZE),
                 }
 
         # Более поздняя миграция (2026-09-23, тем же вечером) — НЕ зависит
@@ -203,6 +211,26 @@ class MainWindow(QMainWindow):
         # components/channel там теперь и нужны (см. depot_tab.py).
         for stale_key in ("backend", "panel", "webdav", "depot", "use_packs"):
             old.pop(stale_key, None)
+
+        # Живой инцидент (2026-09-24, тем же вечером, что появился сам
+        # disk_mode): у пользователя, чей config.json уже содержал явный
+        # depot_publish["pack_size"] (256MB — записан ЭТОЙ же миграцией
+        # выше, в более раннюю сессию, до того как появился disk_mode,
+        # либо старым спинбоксом "Размер pack-файла", убранным сегодня же
+        # вместе со всей секцией "Дополнительно (депо)") — этот явный
+        # застрявший старый номер тихо ПОБЕЖДАЛ новый автовывод по
+        # disk_mode (DepotSyncManager.__init__: `pack_size or
+        # _auto_pack_size` — явное значение всегда в приоритете), так что
+        # реальная публикация продолжала грузить 256MB-паки на HDD уже
+        # ПОСЛЕ фикса безопасных размеров (64MB SSD/96MB HDD), сводя его
+        # на нет для любого, кто хоть раз видел старый спинбокс. Раз
+        # ручного контрола для pack_size в UI больше нет вообще (см.
+        # "настройки депо должны определяться автоматически" в CLAUDE.md)
+        # — оставшееся явное значение гарантированно устарело, его
+        # больше неоткуда взять заново намеренно. Убираем безусловно,
+        # каждый раз при старте, а не только один раз при первой миграции
+        # (idempotent — если ключа уже нет, no-op).
+        cfg.get("depot_publish", {}).pop("pack_size", None)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
