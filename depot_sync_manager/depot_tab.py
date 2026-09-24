@@ -465,11 +465,27 @@ class DepotTab(QWidget):
             QMessageBox.warning(self, "Ошибка", err)
             return
         self._log("📥 Запрашиваем инфо с сервера...")
+
+        # Коммит самой панели (не сборки) — прямой запрос пользователя
+        # (2026-09-24: "добавь чтоб в менеджере информация о сервере
+        # отображалась версия коммита текущего на панели") — живой повод:
+        # в этой же сессии была путаница, реально ли сервер уже получил
+        # только что запушенный фикс, не заходя на него отдельно.
+        # Только для backend="panel" (у WebDAV/Nextcloud нет такого
+        # понятия — это TESL-Panel-специфичный эндпоинт).
+        panel_line = ""
+        if cfg["backend"] == "panel":
+            client = self._make_client(cfg["panel"])
+            server_info = client.get_server_info()
+            if server_info:
+                panel_line = f"🖥 TESL-Panel: коммит {server_info.get('commit', '?')}\n\n"
+
         sync = DepotSyncManager(cfg)
         manifest = sync.fetch_remote_manifest()
         sync.close()
         if manifest:
             info = (
+                f"{panel_line}"
                 f"✅ Текущая версия на сервере:\n"
                 f"  App: {manifest.app_id}\n"
                 f"  Build: #{manifest.build_number} ({manifest.build_id})\n"
@@ -482,7 +498,9 @@ class DepotTab(QWidget):
             self.server_status_label.setText(info)
             self._log(f"✅ Манифест получен: {manifest.version_label()}")
         else:
-            self.server_status_label.setText("⚠️ Манифест не найден (первая публикация?)")
+            self.server_status_label.setText(
+                f"{panel_line}⚠️ Манифест не найден (первая публикация?)"
+            )
             self._log("⚠️ Манифест на сервере не найден — следующая сборка получит номер #1")
 
     # ── Build & publish ───────────────────────────────────────────────────────

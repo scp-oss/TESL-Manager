@@ -217,6 +217,22 @@ class PanelHTTP:
         except Exception as e:
             return False, str(e)
 
+    def get_server_info(self) -> Optional[dict]:
+        """{"commit": "<short-hash>"} с самой панели (не с конкретной
+        сборки) — `GET /api/server-info`, публичный, не зависит от
+        build_id. Прямой запрос пользователя (2026-09-24): показать в
+        менеджере, каким коммитом реально работает панель — живой повод
+        был в этой же сессии (неясно было, дошёл ли фикс nginx до
+        сервера, не заходя на него отдельно). None на любую ошибку —
+        best-effort, как и весь остальной этот транспорт."""
+        try:
+            r = self.session.get(f"{self.base_url}/api/server-info", timeout=TIMEOUT_CONNECT)
+            if r.status_code == 200:
+                return r.json()
+            return None
+        except Exception:
+            return None
+
     # ── Сборки / файлы (для GUI: серверный список/создание/удаление/
     #    переименование сборок и вкладка "Файлы на сервере" — см.
     #    TESL-Panel::panel/app.py /api/builds и /api/depot/<build_id>/files,
