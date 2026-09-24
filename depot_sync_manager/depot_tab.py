@@ -59,13 +59,25 @@ class DepotTab(QWidget):
         self._pending_manifest: DepotManifest = None
         self._pending_delta:    DepotDelta = None
         self._comp_rows: Dict[str, ComponentRow] = {}
+        # Прямой запрос (2026-09-24): "добавь отображение текущего релиза
+        # и на кнопке собрать опубликовать номер следующего релиза" — эта
+        # информация УЖЕ вычислялась (manifest.build_number), но только
+        # внутри _fetch_server_info(), по ручному клику "Инфо с сервера",
+        # и только в лог/многострочный статус-блок — не была видна
+        # постоянно рядом с самой кнопкой публикации. None — ещё не
+        # запрашивали (первый показ страницы/нет подключения).
+        self._next_release_number: "int | None" = None
+        self._release_info_shown = False
         self._init_ui()
         self._load_settings()
 
     def showEvent(self, event):
         super().showEvent(event)
         if self.build_combo.count() == 0 and self._backend_cfg()["panel"].get("base_url"):
-            self._refresh_builds()
+            self._refresh_builds()  # сама вызывает _save_build_choice() -> _refresh_release_info()
+        elif not self._release_info_shown:
+            self._release_info_shown = True
+            self._refresh_release_info()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -156,6 +168,16 @@ class DepotTab(QWidget):
         desc.setWordWrap(True)
         desc.setStyleSheet("font-size: 9pt; color: #888;")
         actions_inner.addWidget(desc)
+
+        # Прямой запрос: постоянно видимое "какой релиз сейчас реально
+        # опубликован" — раньше это было только внутри многострочного
+        # server_status_label ниже, и только по ручному клику "Инфо с
+        # сервера". Обновляется автоматически (см. _refresh_release_info())
+        # при выборе/смене сборки и сразу после успешной публикации — не
+        # только по ручному запросу.
+        self.current_release_label = QLabel("Текущий релиз: —")
+        self.current_release_label.setStyleSheet("font-size: 9pt; color: #aaa;")
+        actions_inner.addWidget(self.current_release_label)
 
         btn_pub_row = QHBoxLayout()
 
@@ -272,6 +294,11 @@ class DepotTab(QWidget):
         self.mw.file_selector.save_config()
         if hasattr(self.mw, "status_panel"):
             self.mw.status_panel.set_backend(cfg)
+        # Единственная точка схождения ВСЕХ путей, меняющих реально
+        # выбранную сборку (ручной выбор в комбобоксе, _refresh_builds(),
+        # создание/переименование/удаление) — release-info пересчитывается
+        # здесь один раз, а не в каждом из этих мест по отдельности.
+        self._refresh_release_info()
 
     def _refresh_builds(self):
         panel = self._backend_cfg()["panel"]
@@ -457,6 +484,39 @@ class DepotTab(QWidget):
         else:
             self.server_status_label.setText(f"❌ {msg}")
             self._log(f"❌ {msg}")
+
+    def _publish_button_label(self) -> str:
+        if self._next_release_number is None:
+            return "📦 Собрать и опубликовать"
+        return f"📦 Собрать и опубликовать (→ #{self._next_release_number})"
+
+    def _refresh_release_info(self):
+        """Тихо (без QMessageBox — вызывается автоматически, не только по
+        ручному клику) обновляет self.current_release_label и номер на
+        кнопке публикации. depot_manifest.json — один файл на всю сборку
+        (не per-канал, см. DepotSyncManager._rp() — путь не зависит от
+        channel), так что "следующий номер" не меняется от выбора канала
+        в комбобоксе — достаточно пересчитывать при смене САМОЙ сборки и
+        после публикации, канал здесь ни при чём."""
+        cfg = self._build_runtime_config()
+        if self._validate_backend(cfg):
+            self.current_release_label.setText("Текущий релиз: — (настройте подключение и выберите сборку)")
+            self._next_release_number = None
+            self.btn_publish.setText(self._publish_button_label())
+            return
+        sync = DepotSyncManager(cfg)
+        manifest = sync.fetch_remote_manifest()
+        sync.close()
+        if manifest:
+            self.current_release_label.setText(
+                f"Текущий релиз: #{manifest.build_number}  "
+                f"({manifest.human_size()}, {manifest.created_at[:19]})"
+            )
+            self._next_release_number = manifest.build_number + 1
+        else:
+            self.current_release_label.setText("Текущий релиз: ещё не публиковалось")
+            self._next_release_number = 1
+        self.btn_publish.setText(self._publish_button_label())
 
     def _fetch_server_info(self):
         cfg = self._build_runtime_config()
@@ -661,6 +721,11 @@ class DepotTab(QWidget):
 
         if ok:
             self._log(f"✅ {msg}")
+            # Сразу же обновляем "Текущий релиз"/номер на кнопке — иначе
+            # оператор увидел бы старое число до следующего ручного "Инфо
+            # с сервера" или перезахода на страницу, хотя публикация,
+            # только что завершившаяся успешно, эти данные уже изменила.
+            self._refresh_release_info()
             QMessageBox.information(self, "Успешно", msg)
         else:
             self._log(f"❌ {msg}")
@@ -679,7 +744,7 @@ class DepotTab(QWidget):
         if busy:
             self.btn_publish.setText("⏳ Работает...")
         else:
-            self.btn_publish.setText("📦 Собрать и опубликовать")
+            self.btn_publish.setText(self._publish_button_label())
 
     def _cleanup_thread(self):
         if self._thread and self._thread.isRunning():
