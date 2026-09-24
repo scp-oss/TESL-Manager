@@ -41,6 +41,7 @@ from themes import ThemeManager
 from theme_dialog import ThemeDialog
 from depot_tab import DepotTab, CFG_KEY as DEPOT_CFG_KEY
 from files_tab import FilesTab
+from documents_tab import DocumentsTab
 
 
 class StatusBar(QFrame):
@@ -267,6 +268,15 @@ class MainWindow(QMainWindow):
         self.files_tab = FilesTab(self)
         self.files_tab.log_message.connect(self.log_message)
         self._add_page("🗂️ Файлы на сервере", self.files_tab)
+
+        # Прямой запрос (2026-09-24): шаблоны настроек игры (редактируемые,
+        # см. ini_editor.py) и .bat-патчи (применяются лаунчером по порядку
+        # имени файла) — общие на всю сборку, отдельная вкладка, см.
+        # documents_tab.py. Только для backend="panel" — WebDAV-путь этой
+        # фичи не касается (прямой запрос был именно про TESL-Panel).
+        self.documents_tab = DocumentsTab(self)
+        self.documents_tab.log_message.connect(self.log_message)
+        self._add_page("📄 Документы и патчи", self.documents_tab)
 
         self.settings_page_index = self._add_page("⚙️ Настройки", self._build_settings_tab())
         self._add_page("📝 Лог (расширенный)", self._build_log_tab())
