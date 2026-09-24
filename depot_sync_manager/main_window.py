@@ -364,6 +364,34 @@ class MainWindow(QMainWindow):
         # просто больше нигде не редактируется из UI, но продолжает
         # действовать как есть (не сбрасывается принудительно).
 
+        # ── Тип диска на сервере ─────────────────────────────────────────────
+        # Единственное исключение из "настройки депо — автоматически" выше:
+        # тип диска — физический факт про СЕРВЕР, который невозможно
+        # вывести из конфига или замерить с клиента без доступа к нему —
+        # обязательно должен сказать оператор. Всё остальное (размер
+        # pack-файла, параллелизм заливки) выводится из этого ОДНОГО
+        # выбора автоматически, см. depot_sync_manager.py::DepotSyncManager
+        # и CLAUDE.md "Алгоритм заливки под SSD/HDD" (прямой запрос
+        # 2026-09-23: "проработай тщательно алгоритм для hdd").
+        disk_box = QGroupBox("🖴 Тип диска на сервере")
+        disk_layout = QVBoxLayout(disk_box)
+        self.disk_mode_combo = QComboBox()
+        self.disk_mode_combo.addItem("HDD — последовательная заливка, крупные pack-файлы", "hdd")
+        self.disk_mode_combo.addItem("SSD — параллельная заливка", "ssd")
+        self.disk_mode_combo.currentIndexChanged.connect(self._save_disk_mode)
+        disk_layout.addWidget(self.disk_mode_combo)
+        disk_hint = QLabel(
+            "HDD — безопасный выбор по умолчанию: заливка строго "
+            "последовательная, файлы крупнее (1GB), меньше случайных "
+            "перемещений головки при записи и последующем чтении "
+            "лаунчером. SSD — заливка в несколько параллельных потоков, "
+            "диск не деградирует от случайного доступа."
+        )
+        disk_hint.setStyleSheet("color: #888; font-size: 9pt;")
+        disk_hint.setWordWrap(True)
+        disk_layout.addWidget(disk_hint)
+        layout.addWidget(disk_box)
+
         # ── Отладка ───────────────────────────────────────────────────────────
         # Прямой запрос пользователя (2026-09-23): "добавь дебаг режим чтобы
         # при нём лог приложения отправлялся в панель и добавь отправку
@@ -533,6 +561,13 @@ class MainWindow(QMainWindow):
         # в UI, см. "настройки депо должны определяться автоматически" у
         # _build_settings_tab(); значения по-прежнему читаются с дефолтами
         # напрямую в depot_tab.py::_backend_cfg()/_build_runtime_config().
+        # disk_mode — единственное исключение, см. секцию "🖴 Тип диска на
+        # сервере" выше.
+        saved_disk_mode = cfg.get("depot_publish", {}).get("disk_mode", "hdd")
+        idx = self.disk_mode_combo.findData(saved_disk_mode)
+        self.disk_mode_combo.blockSignals(True)
+        self.disk_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.disk_mode_combo.blockSignals(False)
 
         # Debug mode — блокируем сигнал на время загрузки, чтобы не
         # запустить _on_debug_mode_toggled() (сохранение конфига + попытка
@@ -554,6 +589,13 @@ class MainWindow(QMainWindow):
         self.file_selector.save_config()
         self.status_panel.set_backend(cfg)
         self.log_message(f"✅ Backend публикации: {cfg['backend']}")
+
+    def _save_disk_mode(self, _idx: int = 0):
+        cfg = self.config
+        disk_mode = self.disk_mode_combo.currentData()
+        cfg.setdefault("depot_publish", {})["disk_mode"] = disk_mode
+        self.file_selector.save_config()
+        self.log_message(f"✅ Тип диска на сервере: {disk_mode.upper()}")
 
     def _update_panel_connection_label(self, base_url: str):
         from urllib.parse import urlparse

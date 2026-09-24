@@ -34,7 +34,8 @@ from chunk_manager import (
     CHUNKS_DIR, VERSIONS_DIR, DEPOT_META, DEFAULT_CHUNK_SIZE,
 )
 from pack_writer import (
-    PackWriter, DEFAULT_PACK_SIZE, write_chunk_index_db, read_chunk_index_db,
+    PackWriter, DEFAULT_PACK_SIZE, HDD_PACK_SIZE,
+    write_chunk_index_db, read_chunk_index_db,
 )
 from threads import ThreadSafeWorker
 
@@ -54,6 +55,13 @@ MAX_RETRIES      = 3
 RETRY_BACKOFF    = (1, 3, 7)
 
 UPLOAD_WORKERS   = 4
+
+# Заливка pack-файлов на SSD-сервер — параллельно, тем же принципом, что
+# UPLOAD_WORKERS у per-chunk протокола (SSD не деградирует на случайном
+# доступе, узкое место — сеть/CPU, не диск). Для HDD параллелизм НЕ
+# используется вообще (строго один PUT за раз) — см. execute_sync_packed()
+# и CLAUDE.md "Алгоритм заливки под SSD/HDD" за обоснование.
+UPLOAD_WORKERS_PACKS_SSD = 4
 
 DAV_NS = "{DAV:}"
 
@@ -422,7 +430,20 @@ class DepotSyncManager(QObject):
         # публиковать через WebDAV, или не паковать и публиковать через
         # panel, любая комбинация валидна.
         self.use_packs = bool(config.get("use_packs", False))
-        self.pack_size = int(config.get("depot", {}).get("pack_size", DEFAULT_PACK_SIZE))
+        # Тип диска на сервере — единственная ручная настройка, всё
+        # остальное (размер pack-файла, параллелизм заливки) выводится из
+        # неё автоматически (прямой запрос 2026-09-23: "настройки депо
+        # должны определяться автоматически" + отдельный запрос "проработай
+        # тщательно алгоритм для hdd"). "hdd" — дефолт по умолчанию:
+        # безопаснее ошибиться в сторону последовательной заливки на SSD
+        # (просто чуть медленнее, чем могло бы быть), чем ошибиться в
+        # сторону параллельной заливки на HDD (реальная деградация из-за
+        # random I/O, ровно то, из-за чего вообще появился pack_writer.py —
+        # см. "Упаковка чанков в pack-файлы" выше, iostat-подтверждение
+        # случайного чтения на РЕАЛЬНОМ сервере пользователя).
+        self.disk_mode = config.get("depot", {}).get("disk_mode", "hdd")
+        _auto_pack_size = DEFAULT_PACK_SIZE if self.disk_mode == "ssd" else HDD_PACK_SIZE
+        self.pack_size = int(config.get("depot", {}).get("pack_size") or _auto_pack_size)
         self._dav = None   # NextcloudDAV | PanelHTTP, в зависимости от self.backend
 
     def _get_dav(self):
@@ -731,28 +752,22 @@ class DepotSyncManager(QObject):
                     self.progress.emit(done, total, f"Упаковка {cid[:12]}…")
                 pw.finalize()
 
-                self.log.emit(f"📤 Загружаем {len(pw.pack_paths)} pack-файл(ов)…")
+                self.log.emit(
+                    f"📤 Загружаем {len(pw.pack_paths)} pack-файл(ов) "
+                    f"(режим: {self.disk_mode.upper()})…"
+                )
                 # Прогресс-бар "как в лаунчере" (прямой запрос пользователя,
                 # 2026-09-23) — та же схема сглаживания, что в execute_sync()
-                # выше, но по гранулярности pack-файлов (нет byte-level
-                # callback'а внутри dav.put_file(), это грубее per-chunk
-                # сэмплирования launcher'а, но для файлов по умолчанию
-                # 256MB даёт обновление в разумном темпе на реальной сборке).
+                # выше, по гранулярности pack-файлов (нет byte-level
+                # callback'а внутри dav.put_file()).
                 total_upload_bytes = sum(p.stat().st_size for p in pw.pack_paths)
                 uploaded_bytes = 0
                 last_sample_t = time.time()
                 last_sample_uploaded = 0
                 smoothed_speed = 0.0
-                for pack_path in pw.pack_paths:
-                    if stop_fn and stop_fn():
-                        return False, "Остановлено пользователем"
-                    ok = dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path)
-                    if not ok:
-                        return False, f"Не удалось загрузить {pack_path.name}"
-                    pack_size = pack_path.stat().st_size
-                    uploaded_bytes += pack_size
-                    self.log.emit(f"  ✅ {pack_path.name} ({pack_size // 1024} KB)")
 
+                def _report_progress():
+                    nonlocal last_sample_t, last_sample_uploaded, smoothed_speed
                     now = time.time()
                     sample_dt = now - last_sample_t
                     if sample_dt >= 0.5:
@@ -769,6 +784,47 @@ class DepotSyncManager(QObject):
                         int(uploaded_bytes), int(total_upload_bytes),
                         f"{pct}% — ⬆ {smoothed_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
                     )
+
+                if self.disk_mode == "ssd":
+                    # SSD: параллельная заливка (UPLOAD_WORKERS_PACKS_SSD
+                    # потоков) — диск не боится конкурентной записи в
+                    # разные файлы, узкое место — сеть/CPU. requests.Session
+                    # у dav (см. NextcloudDAV/PanelHTTP) уже настроен под
+                    # конкурентные запросы (тот же паттерн, что и per-chunk
+                    # протокол execute_sync() выше, тоже параллельный через
+                    # тот же dav).
+                    def _upload_one_pack(pp: Path) -> Tuple[str, bool, int]:
+                        ok = dav.put_file(self._rp(PACKS_DIR, pp.name), pp)
+                        return pp.name, ok, pp.stat().st_size
+
+                    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS_PACKS_SSD) as pool:
+                        futures = {pool.submit(_upload_one_pack, pp): pp for pp in pw.pack_paths}
+                        for future in as_completed(futures):
+                            if stop_fn and stop_fn():
+                                pool.shutdown(wait=False, cancel_futures=True)
+                                return False, "Остановлено пользователем"
+                            name, ok, pack_size = future.result()
+                            if not ok:
+                                pool.shutdown(wait=False, cancel_futures=True)
+                                return False, f"Не удалось загрузить {name}"
+                            uploaded_bytes += pack_size
+                            self.log.emit(f"  ✅ {name} ({pack_size // 1024} KB)")
+                            _report_progress()
+                else:
+                    # HDD: строго последовательно, один PUT за раз — см.
+                    # CLAUDE.md "Алгоритм заливки под SSD/HDD" за полное
+                    # обоснование (random-write penalty на вращающемся
+                    # диске при параллельной записи в разные файлы).
+                    for pack_path in pw.pack_paths:
+                        if stop_fn and stop_fn():
+                            return False, "Остановлено пользователем"
+                        ok = dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path)
+                        if not ok:
+                            return False, f"Не удалось загрузить {pack_path.name}"
+                        pack_size = pack_path.stat().st_size
+                        uploaded_bytes += pack_size
+                        self.log.emit(f"  ✅ {pack_path.name} ({pack_size // 1024} KB)")
+                        _report_progress()
 
                 merged = {**existing_index, **pw.locations}
                 index_path = pack_dir / CHUNK_INDEX_NAME

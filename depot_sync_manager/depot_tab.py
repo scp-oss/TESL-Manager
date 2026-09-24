@@ -32,7 +32,6 @@ from PyQt6.QtGui import QFont
 
 from chunk_manager import DEFAULT_CHUNK_SIZE, DepotManifest, DepotDelta
 from depot_sync_manager import DepotBuildWorker, DepotSyncManager
-from pack_writer import DEFAULT_PACK_SIZE
 from depot_confirm_dialog import DepotConfirmDialog
 from release_tab import ComponentRow
 from config import COMPONENT_NAMES, DEFAULT_COMPONENTS_CONFIG
@@ -403,7 +402,15 @@ class DepotTab(QWidget):
                 "depot_id":   1,
                 "channel":    self.channel_combo.currentText(),
                 "chunk_size": publish.get("chunk_size", DEFAULT_CHUNK_SIZE),
-                "pack_size":  publish.get("pack_size", DEFAULT_PACK_SIZE),
+                # pack_size сознательно НЕ дефолтится здесь на конкретное
+                # число (было DEFAULT_PACK_SIZE=256MB, всегда SSD-размер) —
+                # DepotSyncManager.__init__ сам выбирает 256MB/1GB по
+                # disk_mode, если явного значения нет; передать сюда
+                # заранее конкретный дефолт означало бы, что HDD-режим
+                # никогда не получит свой 1GB-дефолт, см. CLAUDE.md
+                # "Алгоритм заливки под SSD/HDD".
+                "pack_size":  publish.get("pack_size"),
+                "disk_mode":  publish.get("disk_mode", "hdd"),
             },
             "components": self._get_components_cfg(),
         }
