@@ -22,7 +22,14 @@ import requests
 
 
 TIMEOUT_CONNECT = 15
-TIMEOUT_PUT     = 120
+# 300с, не 120 — согласовано с TESL-Panel's nginx (client_body_timeout/
+# proxy_read_timeout/proxy_send_timeout, см. её nginx-tesl-panel.conf.
+# template) после живого инцидента 2026-09-24: клиентский таймаут
+# должен быть не короче серверного, иначе на медленном канале клиент
+# первым обрывает соединение при загрузке крупного pack-файла, и
+# сообщение об ошибке выглядит как обрыв сети, а не как настоящий 413/
+# таймаут сервера.
+TIMEOUT_PUT     = 300
 TIMEOUT_GET     = 60
 
 MAX_RETRIES   = 3
@@ -86,6 +93,17 @@ class PanelHTTP:
             "Authorization": f"Bearer {token}",
         })
         self.last_response = None
+        # Живой случай (2026-09-24): put_file() глотал реальную причину
+        # отказа (`except Exception: return False`) — реальный крэш
+        # публикации на проде оказался 413 от nginx (client_max_body_size
+        # был 64MB, рассчитан на одиночные чанки по 4MB, никто не поднял
+        # его, когда появились pack-файлы по 256MB+), но диалог в GUI
+        # показывал только голое "Не удалось загрузить pack-00001.bin" —
+        # без этого текста причину нашли бы не сразу. last_error — то же,
+        # что last_response, но переживает и сетевые исключения (когда
+        # last_response остался бы от ПРЕДЫДУЩЕГО успешного запроса, вводя
+        # в заблуждение), см. CLAUDE.md "Живой инцидент: 413 от nginx...".
+        self.last_error = ""
 
     def _url(self, rel_path: str) -> str:
         return f"{self.base_url}/api/depot/{self.build_id}/{rel_path.strip('/')}"
@@ -117,17 +135,23 @@ class PanelHTTP:
         return True
 
     def put(self, path: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+        self.last_error = ""
         try:
             r = self._retry(
                 self.session.put, self._url(path), data=data,
                 headers={"Content-Type": content_type}, timeout=TIMEOUT_PUT,
             )
             self.last_response = r
-            return r.status_code in (200, 201, 204)
-        except Exception:
+            if r.status_code in (200, 201, 204):
+                return True
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return False
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             return False
 
     def put_file(self, path: str, local_path, content_type: str = "application/octet-stream") -> bool:
+        self.last_error = ""
         try:
             with open(local_path, "rb") as f:
                 r = self._retry(
@@ -135,8 +159,12 @@ class PanelHTTP:
                     headers={"Content-Type": content_type}, timeout=TIMEOUT_PUT,
                 )
             self.last_response = r
-            return r.status_code in (200, 201, 204)
-        except Exception:
+            if r.status_code in (200, 201, 204):
+                return True
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return False
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             return False
 
     def get_bytes(self, path: str) -> Optional[bytes]:

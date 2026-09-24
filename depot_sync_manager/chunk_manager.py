@@ -7,10 +7,28 @@ Chunk Manager — ядро depot-системы.
 import os
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Iterator, List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 from PyQt6.QtCore import QObject, pyqtSignal
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Тот же формат/копия, что depot_sync_manager.py::_fmt_eta() и
+    TESL/launcher/core/chunk_installer.py::_fmt_eta() — не импортируется
+    оттуда напрямую, чтобы не создавать циклический импорт
+    (depot_sync_manager.py сам импортирует из этого модуля)."""
+    if seconds < 0 or seconds != seconds:   # NaN check без импорта math
+        return "?"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}ч{m:02d}м"
+    if m:
+        return f"{m}м{s:02d}с"
+    return f"{s}с"
 
 
 # ── Константы ─────────────────────────────────────────────────────────────────
@@ -243,9 +261,28 @@ class ChunkManager(QObject):
 
         prev_files = (prev_manifest.files if prev_manifest else {})
 
+        # Прогресс "как в лаунчере" (прямой запрос пользователя,
+        # 2026-09-24: "ета для хешинга всё ещё нет" — раньше здесь была
+        # только строка "Хэшируем: <файл> [n/total]" без скорости/ETA,
+        # хотя upload-этап её уже получил) — та же схема сглаживания
+        # (сэмпл не чаще раза в 0.5с, экспоненциальное сглаживание
+        # alpha=0.3), что уже используют execute_sync()/execute_sync_
+        # packed() в depot_sync_manager.py. total_bytes считается ДО
+        # цикла — отдельный проход stat() по всем файлам, дёшево
+        # относительно самого хеширования, которое доминирует по времени.
+        total_bytes = 0
+        for fp in all_files:
+            try:
+                total_bytes += fp.stat().st_size
+            except OSError:
+                pass
+        processed_bytes = 0
+        last_sample_t = time.time()
+        last_sample_bytes = 0
+        smoothed_speed = 0.0
+
         for i, file_path in enumerate(all_files):
             rel_path = str(file_path.relative_to(local_dir)).replace("\\", "/")
-            self.progress.emit(i + 1, total, f"Хэшируем: {rel_path}")
 
             try:
                 stat = file_path.stat()
@@ -265,12 +302,14 @@ class ChunkManager(QObject):
                                 chunks=prev_entry.chunks,
                             )
                             stats.unchanged += 1
+                            processed_bytes += stat.st_size
                             continue
 
                 # Новый или изменившийся файл — нарезаем
                 entry = self.slice_file_entry(file_path, rel_path)
                 entries[rel_path] = entry
                 stats.processed += 1
+                processed_bytes += stat.st_size
 
             except PermissionError:
                 self.log.emit(f"⚠️ Нет доступа: {rel_path}")
@@ -278,6 +317,24 @@ class ChunkManager(QObject):
             except Exception as e:
                 self.log.emit(f"⚠️ Ошибка обработки {rel_path}: {e}")
                 stats.errors += 1
+            finally:
+                now = time.time()
+                sample_dt = now - last_sample_t
+                if sample_dt >= 0.5:
+                    inst = (processed_bytes - last_sample_bytes) / sample_dt
+                    alpha = 0.3
+                    smoothed_speed = inst if smoothed_speed == 0 else (
+                        alpha * inst + (1 - alpha) * smoothed_speed)
+                    last_sample_t = now
+                    last_sample_bytes = processed_bytes
+                pct = int(processed_bytes / total_bytes * 100) if total_bytes else 100
+                bytes_remaining = total_bytes - processed_bytes
+                eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
+                self.progress.emit(
+                    i + 1, total,
+                    f"{pct}% — 🔒 {smoothed_speed / 1024 / 1024:.1f} MB/s — "
+                    f"осталось: {eta} — {rel_path}"
+                )
 
         return entries, stats
 

@@ -46,7 +46,11 @@ CHUNK_INDEX_NAME = "chunk_index.db"
 # ── Константы (откалиброваны по probe) ───────────────────────────────────────
 
 TIMEOUT_CONNECT  = 15
-TIMEOUT_PUT      = 120
+# 300с, не 120 — см. тот же живой инцидент 2026-09-24 в panel_client.py
+# (согласовано с TESL-Panel's nginx-таймаутами) — крупный pack-файл на
+# медленном канале может не уложиться в старые 120с даже без ошибки
+# сервера.
+TIMEOUT_PUT      = 300
 TIMEOUT_GET      = 60
 TIMEOUT_PROPFIND = 30
 TIMEOUT_META     = 20
@@ -139,6 +143,11 @@ class NextcloudDAV:
 
         # Для хранения последнего ответа (для отладки)
         self.last_response = None
+        # last_error — см. panel_client.py::PanelHTTP.last_error (тот же
+        # живой случай 2026-09-24: 413 от nginx на реальном сервере
+        # маскировался общим "Не удалось загрузить" — здесь тот же фикс,
+        # для WebDAV-транспорта).
+        self.last_error = ""
 
     # ── URL с правильным кодированием спецсимволов ───────────────────────────
 
@@ -287,6 +296,7 @@ class NextcloudDAV:
         data:         bytes,
         content_type: str = "application/octet-stream",
     ) -> bool:
+        self.last_error = ""
         try:
             r = self._retry(
                 self.session.put,
@@ -296,8 +306,12 @@ class NextcloudDAV:
                 timeout=TIMEOUT_PUT,
             )
             self.last_response = r
-            return r.status_code in (200, 201, 204)
-        except Exception:
+            if r.status_code in (200, 201, 204):
+                return True
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return False
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             return False
 
     def put_file(
@@ -306,6 +320,7 @@ class NextcloudDAV:
         local_path:   Path,
         content_type: str = "application/octet-stream",
     ) -> bool:
+        self.last_error = ""
         try:
             with open(local_path, "rb") as f:
                 r = self._retry(
@@ -316,8 +331,12 @@ class NextcloudDAV:
                     timeout=TIMEOUT_PUT,
                 )
             self.last_response = r
-            return r.status_code in (200, 201, 204)
-        except Exception:
+            if r.status_code in (200, 201, 204):
+                return True
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return False
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             return False
 
     # ── GET ───────────────────────────────────────────────────────────────────
@@ -676,7 +695,7 @@ class DepotSyncManager(QObject):
             content_type="application/json",
         )
         if not ok:
-            return False, "Критическая ошибка: не удалось обновить depot_manifest.json"
+            return False, f"Критическая ошибка: не удалось обновить depot_manifest.json: {dav.last_error or 'см. лог'}"
 
         msg = (
             f"✅ Build #{new_manifest.build_number} опубликован! "
@@ -726,6 +745,19 @@ class DepotSyncManager(QObject):
                 self.log.emit(f"📦 Упаковываем {total} чанков ({self.pack_size / 1024 / 1024:.1f}MB/pack)…")
                 pw = PackWriter(pack_dir / "out", pack_size=self.pack_size)
                 done = 0
+                # Прогресс с процентом/скоростью/ETA — та же схема
+                # сглаживания, что у скана (chunk_manager.py::
+                # scan_directory) и заливки ниже (прямой запрос
+                # пользователя, 2026-09-24: "ета для хешинга всё ещё
+                # нет" — этап упаковки страдал тем же самым).
+                total_pack_bytes = sum(
+                    chunk_source[cid][2] for cid in delta.chunks_to_upload
+                    if cid in chunk_source
+                )
+                packed_bytes = 0
+                last_sample_t = time.time()
+                last_sample_bytes = 0
+                smoothed_speed = 0.0
                 # sorted() — тот же порядок, в котором лаунчер и так
                 # запрашивает чанки (см. TESL/core/chunk_installer.py) —
                 # упаковка в этом же порядке и есть весь смысл схемы
@@ -749,7 +781,25 @@ class DepotSyncManager(QObject):
                     except Exception as e:
                         return False, f"Ошибка чтения {rel_path} при упаковке: {e}"
                     done += 1
-                    self.progress.emit(done, total, f"Упаковка {cid[:12]}…")
+                    packed_bytes += size
+
+                    now = time.time()
+                    sample_dt = now - last_sample_t
+                    if sample_dt >= 0.5:
+                        inst = (packed_bytes - last_sample_bytes) / sample_dt
+                        alpha = 0.3
+                        smoothed_speed = inst if smoothed_speed == 0 else (
+                            alpha * inst + (1 - alpha) * smoothed_speed)
+                        last_sample_t = now
+                        last_sample_bytes = packed_bytes
+                    pct = int(packed_bytes / total_pack_bytes * 100) if total_pack_bytes else 100
+                    bytes_remaining = total_pack_bytes - packed_bytes
+                    eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
+                    self.progress.emit(
+                        done, total,
+                        f"{pct}% — 📦 {smoothed_speed / 1024 / 1024:.1f} MB/s — "
+                        f"осталось: {eta} — {cid[:12]}…"
+                    )
                 pw.finalize()
 
                 self.log.emit(
@@ -793,9 +843,15 @@ class DepotSyncManager(QObject):
                     # конкурентные запросы (тот же паттерн, что и per-chunk
                     # протокол execute_sync() выше, тоже параллельный через
                     # тот же dav).
-                    def _upload_one_pack(pp: Path) -> Tuple[str, bool, int]:
+                    # Ошибка захватывается ЗДЕСЬ (dav.last_error читается
+                    # сразу после своего put_file(), в том же вызове) — а
+                    # не в главном потоке после future.result(), потому что
+                    # dav один на все потоки-загрузчики: если читать
+                    # last_error снаружи, к этому моменту его может уже
+                    # перезаписать ДРУГОЙ, ещё выполняющийся future.
+                    def _upload_one_pack(pp: Path) -> Tuple[str, bool, int, str]:
                         ok = dav.put_file(self._rp(PACKS_DIR, pp.name), pp)
-                        return pp.name, ok, pp.stat().st_size
+                        return pp.name, ok, pp.stat().st_size, dav.last_error
 
                     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS_PACKS_SSD) as pool:
                         futures = {pool.submit(_upload_one_pack, pp): pp for pp in pw.pack_paths}
@@ -803,10 +859,10 @@ class DepotSyncManager(QObject):
                             if stop_fn and stop_fn():
                                 pool.shutdown(wait=False, cancel_futures=True)
                                 return False, "Остановлено пользователем"
-                            name, ok, pack_size = future.result()
+                            name, ok, pack_size, err = future.result()
                             if not ok:
                                 pool.shutdown(wait=False, cancel_futures=True)
-                                return False, f"Не удалось загрузить {name}"
+                                return False, f"Не удалось загрузить {name}: {err or 'см. лог'}"
                             uploaded_bytes += pack_size
                             self.log.emit(f"  ✅ {name} ({pack_size // 1024} KB)")
                             _report_progress()
@@ -820,7 +876,7 @@ class DepotSyncManager(QObject):
                             return False, "Остановлено пользователем"
                         ok = dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path)
                         if not ok:
-                            return False, f"Не удалось загрузить {pack_path.name}"
+                            return False, f"Не удалось загрузить {pack_path.name}: {dav.last_error or 'см. лог'}"
                         pack_size = pack_path.stat().st_size
                         uploaded_bytes += pack_size
                         self.log.emit(f"  ✅ {pack_path.name} ({pack_size // 1024} KB)")
@@ -831,7 +887,7 @@ class DepotSyncManager(QObject):
                 write_chunk_index_db(index_path, merged)
                 ok = dav.put_file(self._rp(CHUNK_INDEX_NAME), index_path)
                 if not ok:
-                    return False, "Не удалось загрузить chunk_index.db"
+                    return False, f"Не удалось загрузить chunk_index.db: {dav.last_error or 'см. лог'}"
                 self.log.emit(f"📋 chunk_index.db обновлён: {len(merged)} чанков всего")
             else:
                 self.log.emit("ℹ️  Новых чанков нет")
@@ -867,7 +923,7 @@ class DepotSyncManager(QObject):
             content_type="application/json",
         )
         if not ok:
-            return False, "Критическая ошибка: не удалось обновить depot_manifest.json"
+            return False, f"Критическая ошибка: не удалось обновить depot_manifest.json: {dav.last_error or 'см. лог'}"
 
         msg = (
             f"✅ Build #{new_manifest.build_number} опубликован (packed)! "
