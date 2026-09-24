@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QFileDialog,
     QMessageBox, QGroupBox, QLineEdit, QCheckBox,
     QListWidget, QListWidgetItem, QStackedWidget, QComboBox,
-    QFormLayout, QStatusBar, QFrame, QScrollArea,
+    QFormLayout, QStatusBar, QFrame, QScrollArea, QInputDialog,
 )
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import pyqtSignal, QTimer
@@ -233,6 +233,144 @@ class MainWindow(QMainWindow):
         # (idempotent — если ключа уже нет, no-op).
         cfg.get("depot_publish", {}).pop("pack_size", None)
 
+    # ── Глобальный выбор сборки (2026-09-24) ─────────────────────────────────
+    # Перенесено из DepotTab (была единственной страницей с выбором сборки) —
+    # логика 1:1 та же (build_id в itemData, build_name — текст пункта, пишется
+    # в cfg["panel"]), только точка схождения теперь одна на всё приложение,
+    # а не три независимых копии (DepotTab.build_combo,
+    # DepotFilesTab.project_combo, DocumentsTab.project_combo).
+
+    def current_build_id(self) -> str:
+        return self.build_combo.currentData() or ""
+
+    def current_build_name(self) -> str:
+        return self.build_combo.currentText().strip()
+
+    def _make_panel_client(self, build_id: str = ""):
+        from panel_client import PanelHTTP
+        panel = self.config.get("panel", {})
+        return PanelHTTP(
+            base_url=panel.get("base_url", ""), build_id=build_id,
+            token=panel.get("token", ""), verify_ssl=panel.get("verify_ssl", True),
+        )
+
+    def _notify_build_changed(self):
+        """Единая точка рассылки для всех страниц, читающих текущую сборку —
+        каждая сама решает, обновляться ли немедленно (видима сейчас) или
+        просто обновить лейбл/сброить кэш до своего следующего showEvent."""
+        for page in (self.depot_tab, self.files_tab.panel_widget, self.documents_tab):
+            fn = getattr(page, "on_build_changed", None)
+            if fn:
+                fn()
+
+    def _save_build_choice(self, _idx: int = 0):
+        cfg = self.config
+        panel = dict(cfg.get("panel", {}))
+        panel["build_id"]   = self.build_combo.currentData() or ""
+        panel["build_name"] = self.build_combo.currentText().strip()
+        cfg["panel"] = panel
+        self.file_selector.save_config()
+        if hasattr(self, "status_panel"):
+            self.status_panel.set_backend(cfg)
+        self._notify_build_changed()
+
+    def _refresh_builds(self):
+        panel = self.config.get("panel", {})
+        if not panel.get("base_url"):
+            QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к панели на странице «⚙️ Настройки»!")
+            return
+        client = self._make_panel_client()
+        builds = client.list_builds()
+        client.close()
+        current_id = self.current_build_id()
+        self.build_combo.blockSignals(True)
+        self.build_combo.clear()
+        for b in builds:
+            self.build_combo.addItem(b["name"], b["id"])
+        if current_id:
+            idx = self.build_combo.findData(current_id)
+            if idx >= 0:
+                self.build_combo.setCurrentIndex(idx)
+        self.build_combo.blockSignals(False)
+        # blockSignals() выше означает, что currentIndexChanged НЕ дошёл до
+        # _save_build_choice(), даже если реальный текущий выбор изменился
+        # (первый addItem() в пустой комбобокс сам ставит currentIndex=0,
+        # событие для этого никогда не всплывёт естественным путём, тот же
+        # живой баг, что уже был найден на этом самом коде в depot_tab.py) —
+        # сохраняем явно, а не полагаемся на сигнал.
+        self._save_build_choice()
+        self.log_message(f"📋 Сборок на панели: {len(builds)}")
+
+    def _create_new_build(self):
+        panel = self.config.get("panel", {})
+        if not panel.get("base_url") or not panel.get("token"):
+            QMessageBox.warning(self, "Ошибка", "Сначала подключитесь к панели на странице «⚙️ Настройки»!")
+            return
+        name, ok = QInputDialog.getText(self, "Новая сборка", "Имя сборки (буквы/цифры/_/-):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        client = self._make_panel_client()
+        build, msg = client.create_build(name)
+        client.close()
+        if build:
+            self.log_message(f"✅ Сборка создана: {build['name']} ({build['id'][:8]})")
+            self._refresh_builds()
+            idx = self.build_combo.findData(build["id"])
+            if idx >= 0:
+                self.build_combo.setCurrentIndex(idx)
+            self._save_build_choice()
+        else:
+            QMessageBox.warning(self, "Ошибка", msg)
+
+    def _rename_current_build(self):
+        build_id = self.current_build_id()
+        if not build_id:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите сборку")
+            return
+        old_name = self.build_combo.currentText()
+        new_name, ok = QInputDialog.getText(
+            self, "Переименовать сборку", "Новое имя (буквы/цифры/_/-):", text=old_name,
+        )
+        new_name = (new_name or "").strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        client = self._make_panel_client(build_id)
+        ok2, msg = client.rename_build(build_id, new_name)
+        client.close()
+        if ok2:
+            self.log_message(f"✅ Сборка переименована: {old_name} → {new_name}")
+            self._refresh_builds()
+            idx = self.build_combo.findData(build_id)
+            if idx >= 0:
+                self.build_combo.setCurrentIndex(idx)
+            self._save_build_choice()
+        else:
+            QMessageBox.warning(self, "Ошибка", msg)
+
+    def _delete_current_build(self):
+        build_id = self.current_build_id()
+        if not build_id:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите сборку")
+            return
+        name = self.build_combo.currentText()
+        ans = QMessageBox.question(
+            self, "Удаление сборки",
+            f"Удалить сборку <b>{name}</b> с панели? Это необратимо удалит "
+            f"ВСЕ её чанки и версии на сервере.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        client = self._make_panel_client(build_id)
+        ok = client.delete_build(build_id)
+        client.close()
+        if ok:
+            self.log_message(f"🗑 Сборка удалена: {name}")
+            self._refresh_builds()
+        else:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось удалить сборку {name}")
+
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _create_ui(self):
@@ -244,6 +382,43 @@ class MainWindow(QMainWindow):
 
         self.status_panel = StatusBar()
         root.addWidget(self.status_panel)
+
+        # ── Глобальный выбор сборки ──────────────────────────────────────────
+        # Прямой запрос пользователя (2026-09-24): "сделай выбор сборки
+        # сверху... остальные окна типа релизы и файлы на сервере
+        # показываются от неё" — раньше "🚀 Релизы" (DepotTab.build_combo),
+        # "🗂️ Файлы на сервере" (DepotFilesTab.project_combo) и "📄
+        # Документы и патчи" (DocumentsTab.project_combo) хранили ТРИ
+        # независимых выбора сборки (два из них — units из "показать файлы
+        # ЛЮБОЙ сборки, не только текущей публикации" — фича, которая, как
+        # выяснилось на живом инциденте тем же днём (см. CLAUDE.md "Файлы
+        # на сервере пустая после успешной публикации"), только путала).
+        # Теперь один комбобокс здесь — build_id/build_name пишутся в
+        # cfg["panel"] (тот же ключ, что и раньше), три страницы просто
+        # ЧИТАЮТ current_build_id()/current_build_name() и подписаны на
+        # notify через on_build_changed().
+        build_box = QGroupBox("Сборка")
+        build_row = QHBoxLayout(build_box)
+        self.build_combo = QComboBox()
+        self.build_combo.setMinimumWidth(220)
+        self.build_combo.currentIndexChanged.connect(self._save_build_choice)
+        build_row.addWidget(self.build_combo, stretch=1)
+        btn_refresh_build = QPushButton("🔄")
+        btn_refresh_build.setFixedWidth(32)
+        btn_refresh_build.setToolTip("Обновить список сборок с сервера")
+        btn_refresh_build.clicked.connect(self._refresh_builds)
+        build_row.addWidget(btn_refresh_build)
+        btn_new_build = QPushButton("➕ Новая")
+        btn_new_build.setToolTip("Создать новую сборку на панели")
+        btn_new_build.clicked.connect(self._create_new_build)
+        build_row.addWidget(btn_new_build)
+        btn_rename_build = QPushButton("✏️ Переименовать")
+        btn_rename_build.clicked.connect(self._rename_current_build)
+        build_row.addWidget(btn_rename_build)
+        btn_delete_build = QPushButton("🗑 Удалить")
+        btn_delete_build.clicked.connect(self._delete_current_build)
+        build_row.addWidget(btn_delete_build)
+        root.addWidget(build_box)
 
         body = QWidget()
         body_layout = QHBoxLayout(body)
@@ -601,6 +776,18 @@ class MainWindow(QMainWindow):
         # напрямую в depot_tab.py::_backend_cfg()/_build_runtime_config().
         # disk_mode — единственное исключение, см. секцию "🖴 Тип диска на
         # сервере" выше.
+        # Сборка — заранее известный build_id/build_name (сохранён с прошлого
+        # раза) кладём в комбобокс сразу, без сетевого похода на панель;
+        # полный список подтягивается по 🔄/при первой явной необходимости
+        # (тот же принцип, что был раньше у DepotTab._load_settings()).
+        saved_build_id   = panel.get("build_id", "")
+        saved_build_name = panel.get("build_name", "")
+        if saved_build_id and saved_build_name:
+            self.build_combo.blockSignals(True)
+            self.build_combo.addItem(saved_build_name, saved_build_id)
+            self.build_combo.setCurrentIndex(0)
+            self.build_combo.blockSignals(False)
+
         saved_disk_mode = cfg.get("depot_publish", {}).get("disk_mode", "hdd")
         idx = self.disk_mode_combo.findData(saved_disk_mode)
         self.disk_mode_combo.blockSignals(True)
@@ -618,6 +805,12 @@ class MainWindow(QMainWindow):
 
         self.status_panel.set_backend(cfg)
         self.status_panel.set_components(cfg.get(DEPOT_CFG_KEY, {}).get("components", {}))
+
+        # Сборка уже могла быть заранее выставлена в комбобокс выше (без
+        # сигнала, blockSignals) — страницы должны узнать о ней ДО первого
+        # показа (иначе "Релизы", как страница по умолчанию, откроется с
+        # пустым "Текущий релиз: —" до первого клика где-либо).
+        self._notify_build_changed()
 
     # ── Backend settings handlers ────────────────────────────────────────────
 
@@ -669,20 +862,21 @@ class MainWindow(QMainWindow):
         # Другой адрес панели — старая выбранная сборка почти наверняка
         # относится к другой панели (id из одной БД builds.db бессмыслен
         # для другой), список нужно перезагрузить с нуля, а не молча
-        # оставлять невалидный выбор. Сам combo выбора сборки живёт
-        # теперь на странице "Релизы" (DepotTab.build_combo), не здесь —
-        # см. её же _refresh_builds()/_create_new_build().
+        # оставлять невалидный выбор. Сам combo выбора сборки — глобальный,
+        # на верхней панели окна (self.build_combo, см. _create_ui()), а не
+        # внутри отдельной страницы — см. _refresh_builds()/_create_new_build()
+        # здесь же.
         if decoded["base_url"] != old_base_url:
             panel_cfg["build_id"]   = ""
             panel_cfg["build_name"] = ""
-            self.depot_tab.build_combo.clear()
+            self.build_combo.clear()
 
         cfg["panel"] = panel_cfg
         self.file_selector.save_config()
         self._update_panel_connection_label(decoded["base_url"])
         self.status_panel.set_backend(cfg)
         self.log_message(f"✅ Подключено к панели: {decoded['base_url']}")
-        self.depot_tab._refresh_builds()
+        self._refresh_builds()
 
     # ── Debug mode / отправка отчётов в панель ───────────────────────────────
     # Прямой запрос пользователя (2026-09-23): см. debug_reporter.py за

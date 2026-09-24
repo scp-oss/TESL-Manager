@@ -6,10 +6,18 @@ scp-oss/TESL-Panel), десктоп-эквивалент её же
 /admin/project/<name>/files (файловый менеджер в браузере) — тот же
 Bearer-токен, что и публикация из "🚀 Релизы". Настройки соединения
 (URL/токен) читаются из общего cfg["panel"] (настраивается на странице
-"⚙️ Настройки", единожды на всё приложение) — здесь настраивается
-только КАКОЙ проект просматривать (свой отдельный выбор, не обязательно
-совпадающий с текущим проектом публикации — админ может смотреть файлы
-любого проекта).
+"⚙️ Настройки", единожды на всё приложение).
+
+Сборка (какой проект просматривать) — прямой запрос пользователя
+(2026-09-24, "сделай выбор сборки сверху... файлы на сервере
+показываются от неё"): раньше здесь был СВОЙ независимый project_combo
+(админ мог смотреть файлы ЛЮБОЙ сборки, не только текущей публикации) —
+это оказалось источником живой путаницы (см. CLAUDE.md "Файлы на
+сервере пустая после успешной публикации" — комбобокс молча выбирал
+алфавитно первую сборку с сервера, не ту, что реально публиковалась).
+Теперь сборка ВСЕГДА — глобальный выбор сверху окна
+(self.mw.current_build_id(), см. main_window.py) — эта страница только
+читает его и обновляется через on_build_changed().
 
 Только для backend="panel" — у WebDAV уже есть своя вкладка "🗂️ Файлы
 сервера" (server_files_tab.py, PROPFIND-дерево), эта — параллельный
@@ -19,12 +27,28 @@ Bearer-токен, что и публикация из "🚀 Релизы". На
 MAX_INLINE_EDIT_BYTES) и декодируемых как UTF-8 файлов, тот же принцип,
 что и в самой панели (panel/storage.py::MAX_INLINE_EDIT_BYTES) — для
 остального доступны скачать/заменить целиком/удалить.
+
+## Навигация по папкам (2026-09-24)
+
+Прямой запрос: "файлы на сервере не папкой показываются содержимым
+папки а если их больше чем 1 будет как попать в другую" — список файлов
+был плоским (полный относительный путь текстом в каждой строке,
+`packs/pack-00001.bin`), неудобно при реалистичном количестве файлов
+(`chunks/` в неупакованном режиме — сотни/тысячи записей). Теперь
+`_FolderView` строит дерево из плоского списка `[{"path","size"}]",
+показывает содержимое ТЕКУЩЕЙ папки (по умолчанию — корень): подпапки
+первой (📁, агрегированный размер+число файлов), затем файлы этой же
+папки (📄, реальный размер); двойной клик по папке входит в неё, кнопка
+"⬆ .." (и двойной клик по ней же) — уровнем выше. Строка пути (хлебная
+крошка) над таблицей показывает, где сейчас находимся. Выбор/просмотр/
+удаление одного файла (`_selected_path()` и всё, что от него зависит)
+работают только на строках-ФАЙЛАХ — на папке эти кнопки недоступны.
 """
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QComboBox, QLineEdit, QTableWidget, QTableWidgetItem,
+    QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QMessageBox, QFileDialog, QDialog,
     QDialogButtonBox, QTextEdit, QProgressBar,
 )
@@ -152,6 +176,8 @@ class DepotFilesTab(QWidget):
         self._client = None
         self._thread = None
         self._worker = None
+        self._files_cache = []   # плоский список [{"path","size"}] с сервера
+        self._current_dir  = ""  # "" — корень; иначе путь папки без хвостового "/"
         self._init_ui()
 
     # ── UI ───────────────────────────────────────────────────────────────────
@@ -160,22 +186,15 @@ class DepotFilesTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(8)
 
-        conn_box = QGroupBox("Проект на панели")
+        conn_box = QGroupBox("Сборка")
         conn_row = QHBoxLayout(conn_box)
-        conn_row.addWidget(QLabel("Сборка:"))
-        self.project_combo = QComboBox()
-        self.project_combo.setEditable(False)
-        self.project_combo.setMinimumWidth(200)
-        conn_row.addWidget(self.project_combo)
-
-        btn_refresh_projects = QPushButton("🔄")
-        btn_refresh_projects.setToolTip("Обновить список проектов с сервера")
-        btn_refresh_projects.setFixedWidth(36)
-        btn_refresh_projects.clicked.connect(self._refresh_projects)
-        conn_row.addWidget(btn_refresh_projects)
-
+        self.build_hint_label = QLabel("Сборка не выбрана")
+        conn_row.addWidget(self.build_hint_label)
         conn_row.addStretch()
-        hint = QLabel("Соединение (URL панели / токен) настраивается на странице «⚙️ Настройки»")
+        hint = QLabel(
+            "Сборка выбирается вверху окна. Соединение (URL панели / токен) "
+            "настраивается на странице «⚙️ Настройки»"
+        )
         hint.setStyleSheet("color: #888; font-size: 9pt;")
         conn_row.addWidget(hint)
         root.addWidget(conn_box)
@@ -184,6 +203,12 @@ class DepotFilesTab(QWidget):
         self.btn_load = QPushButton("📥 Показать файлы")
         self.btn_load.clicked.connect(self._load_files)
         toolbar.addWidget(self.btn_load)
+
+        self.btn_up = QPushButton("⬆ Вверх")
+        self.btn_up.setEnabled(False)
+        self.btn_up.setToolTip("Перейти в родительскую папку")
+        self.btn_up.clicked.connect(self._navigate_up)
+        toolbar.addWidget(self.btn_up)
 
         self.btn_view = QPushButton("👁 Просмотреть / редактировать")
         self.btn_view.setEnabled(False)
@@ -208,8 +233,12 @@ class DepotFilesTab(QWidget):
         self.progress_bar.setFixedHeight(10)
         root.addWidget(self.progress_bar)
 
+        self.breadcrumb_label = QLabel("📂 / (корень)")
+        self.breadcrumb_label.setStyleSheet("font-size: 9pt; color: #aaa;")
+        root.addWidget(self.breadcrumb_label)
+
         self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Путь", "Размер"])
+        self.table.setHorizontalHeaderLabels(["Имя", "Размер"])
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -218,12 +247,16 @@ class DepotFilesTab(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._on_selection)
-        self.table.itemDoubleClicked.connect(lambda _: self._view_selected())
+        self.table.itemDoubleClicked.connect(lambda _: self._on_row_activated())
         root.addWidget(self.table)
 
-        self.status_label = QLabel("Выберите проект и нажмите «Показать файлы»")
+        self.status_label = QLabel("Выберите сборку вверху окна и нажмите «Показать файлы»")
         self.status_label.setStyleSheet("font-size: 9pt; color: #888;")
         root.addWidget(self.status_label)
+
+    def _update_build_hint(self):
+        name = self.mw.current_build_name()
+        self.build_hint_label.setText(f"Сборка: {name}" if name else "Сборка не выбрана")
 
     # ── Client / config helpers ─────────────────────────────────────────────
 
@@ -242,66 +275,39 @@ class DepotFilesTab(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if self.project_combo.count() == 0:
-            self._refresh_projects()
-            # Тот же инцидент, что и в _refresh_projects() выше: раз теперь
-            # по умолчанию выбирается именно текущая сборка публикации —
-            # сразу же показываем её файлы, а не оставляем пустую таблицу
-            # до отдельного клика "Показать файлы" (пользователь и так уже
-            # только что публиковал и ожидал увидеть результат сразу).
-            if self.project_combo.currentData():
-                self._load_files()
+        self._update_build_hint()
+        if not self._files_cache and self.mw.current_build_id():
+            self._load_files()
 
-    # ── Сборки ───────────────────────────────────────────────────────────────
-    # project_combo хранит build_id в itemData (Qt.ItemDataRole.UserRole),
-    # показывает имя — реальный ключ id, не строка (см. TESL-Panel's
-    # builds_db.py и CLAUDE.md, тот же принцип, что и DepotTab.build_combo).
-
-    def _refresh_projects(self):
-        cfg = self._panel_cfg()
-        if not cfg.get("base_url"):
-            self.status_label.setText(
-                "⚠️ Сначала настройте URL панели/токен на странице «⚙️ Настройки»"
-            )
+    def on_build_changed(self):
+        """MainWindow._notify_build_changed() — глобальный выбор сборки (см.
+        main_window.py) сменился. Сбрасываем текущую папку (путь внутри
+        старой сборки бессмыслен для новой) и обновляем список, но только
+        если страница реально видна — иначе просто чистим кэш до
+        следующего showEvent (тот же принцип, что раньше был у
+        showEvent-only логики, просто теперь запускается и без переключения
+        вкладки, если она уже была активна в момент смены сборки)."""
+        self._update_build_hint()
+        self._current_dir = ""
+        self._files_cache = []
+        self.table.setRowCount(0)
+        build_id = self.mw.current_build_id()
+        if not build_id:
+            self.status_label.setText("Сборка не выбрана — выберите её вверху окна")
+            self.breadcrumb_label.setText("📂 / (корень)")
+            self.btn_up.setEnabled(False)
             return
-        client = self._make_client("")
-        builds = client.list_builds()
-        client.close()
-        current_id = self.project_combo.currentData()
-        self.project_combo.clear()
-        for b in builds:
-            self.project_combo.addItem(b["name"], b["id"])
-        # Живой инцидент (2026-09-24): "залились файлы, при выборе сборки
-        # ничего нет" — этот комбобокс полностью независим от build_combo
-        # на странице «🚀 Релизы» (намеренно, см. докстринг модуля — админ
-        # может смотреть файлы ЛЮБОЙ сборки, не только текущей). Но при
-        # первом открытии вкладки (current_id ещё пуст — ничего не
-        # выбиралось в ЭТОЙ вкладке раньше) Qt молча ставил текущим просто
-        # первый добавленный пункт (фактически — алфавитно первую сборку
-        # с сервера), а не ту, что реально только что публиковалась —
-        # пользователь публиковал в "wallpepa", открывал "Файлы на
-        # сервере", видел там (незамеченно) другую, пустую сборку и решал,
-        # что публикация не удалась, хотя реально файлы были на месте под
-        # правильным build_id (проверено отдельно — GET /api/depot/<id>/
-        # files с packs/*.bin корректно их находит). Раз явного выбора в
-        # ЭТОЙ вкладке ещё не было — по умолчанию предлагаем ту сборку,
-        # что сейчас настроена для публикации (cfg["panel"]["build_id"]),
-        # а не произвольный первый пункт списка; пользователь по-прежнему
-        # волен переключиться на любую другую.
-        if not current_id:
-            current_id = cfg.get("build_id") or None
-        if current_id:
-            idx = self.project_combo.findData(current_id)
-            if idx >= 0:
-                self.project_combo.setCurrentIndex(idx)
-        self.log_message.emit(f"📋 Сборок на панели: {len(builds)}")
+        if self.isVisible():
+            self._load_files()
+        else:
+            self.status_label.setText("Выберите сборку вверху окна и нажмите «Показать файлы»")
 
     # ── Load files ───────────────────────────────────────────────────────────
 
     def _load_files(self):
-        build_id = self.project_combo.currentData()
+        build_id = self.mw.current_build_id()
         if not build_id:
-            QMessageBox.warning(self, "Ошибка", "Выберите сборку")
+            QMessageBox.warning(self, "Ошибка", "Выберите сборку вверху окна")
             return
         cfg = self._panel_cfg()
         if not cfg.get("base_url") or not cfg.get("token"):
@@ -313,7 +319,7 @@ class DepotFilesTab(QWidget):
 
         self._client = self._make_client(build_id)
         self._set_busy(True)
-        name = self.project_combo.currentText()
+        name = self.mw.current_build_name()
         self.status_label.setText(f"Загружаем список файлов сборки «{name}»…")
 
         self._worker = _ListWorker(self._client)
@@ -327,14 +333,14 @@ class DepotFilesTab(QWidget):
     def _on_loaded(self, files: list):
         self._cleanup_thread()
         self._set_busy(False)
-        self.table.setRowCount(0)
-        for entry in sorted(files, key=lambda e: e["path"]):
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(entry["path"]))
-            size_item = QTableWidgetItem(_fmt_size(entry["size"]))
-            size_item.setData(Qt.ItemDataRole.UserRole, entry["size"])
-            self.table.setItem(row, 1, size_item)
+        self._files_cache = files
+        # Папка, в которой мы были (если это не первая загрузка), сохраняется —
+        # обновление/удаление одного файла не должно выбрасывать обратно в
+        # корень, см. докстринг модуля "Навигация по папкам". Если её больше
+        # не существует (например единственный файл в ней удалили) —
+        # _render_current_dir() просто покажет пустое содержимое с рабочей
+        # кнопкой "⬆ Вверх", а не упадёт.
+        self._render_current_dir()
         total_size = sum(e["size"] for e in files)
         self.status_label.setText(f"Файлов: {len(files)}   Общий размер: {_fmt_size(total_size)}")
         self.log_message.emit(f"✅ Файлы депо: {len(files)} ({_fmt_size(total_size)})")
@@ -345,18 +351,110 @@ class DepotFilesTab(QWidget):
         self.status_label.setText(f"❌ {msg}")
         self.log_message.emit(f"❌ {msg}")
 
+    # ── Папки ────────────────────────────────────────────────────────────────
+    # Список с сервера плоский ([{"path","size"}]) — здесь он представляется
+    # как содержимое ТЕКУЩЕЙ папки (self._current_dir): подпапки (агрегат
+    # размера/числа файлов) первыми, затем файлы этой же папки. Тип строки
+    # хранится в Qt.ItemDataRole.UserRole первой колонки — {"type": "up"|
+    # "dir"|"file", "path": ...}.
+
+    def _render_current_dir(self):
+        prefix = f"{self._current_dir}/" if self._current_dir else ""
+        dirs: dict = {}
+        files_here = []
+        for entry in self._files_cache:
+            path = entry["path"]
+            if prefix and not path.startswith(prefix):
+                continue
+            rest = path[len(prefix):]
+            if not rest:
+                continue
+            if "/" in rest:
+                name = rest.split("/", 1)[0]
+                agg = dirs.setdefault(name, {"count": 0, "size": 0})
+                agg["count"] += 1
+                agg["size"] += entry["size"]
+            else:
+                files_here.append({"name": rest, "path": path, "size": entry["size"]})
+
+        self.table.setRowCount(0)
+        self.breadcrumb_label.setText(f"📂 {self._current_dir}" if self._current_dir else "📂 / (корень)")
+        self.btn_up.setEnabled(bool(self._current_dir))
+
+        if self._current_dir:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            up_item = QTableWidgetItem("⬆ ..")
+            up_item.setData(Qt.ItemDataRole.UserRole, {"type": "up"})
+            self.table.setItem(row, 0, up_item)
+            self.table.setItem(row, 1, QTableWidgetItem(""))
+
+        for name in sorted(dirs):
+            agg = dirs[name]
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            full_path = f"{self._current_dir}/{name}" if self._current_dir else name
+            item = QTableWidgetItem(f"📁 {name}/")
+            item.setData(Qt.ItemDataRole.UserRole, {"type": "dir", "path": full_path})
+            self.table.setItem(row, 0, item)
+            count_word = "файл" if agg["count"] % 10 == 1 and agg["count"] % 100 != 11 else "файлов"
+            self.table.setItem(row, 1, QTableWidgetItem(f"{_fmt_size(agg['size'])} ({agg['count']} {count_word})"))
+
+        for f in sorted(files_here, key=lambda e: e["name"]):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            item = QTableWidgetItem(f"📄 {f['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, {"type": "file", "path": f["path"]})
+            self.table.setItem(row, 0, item)
+            size_item = QTableWidgetItem(_fmt_size(f["size"]))
+            size_item.setData(Qt.ItemDataRole.UserRole, f["size"])
+            self.table.setItem(row, 1, size_item)
+
+        self._on_selection()
+
+    def _navigate_into(self, path: str):
+        self._current_dir = path
+        self._render_current_dir()
+
+    def _navigate_up(self):
+        if not self._current_dir:
+            return
+        parent = self._current_dir.rsplit("/", 1)
+        self._current_dir = parent[0] if len(parent) > 1 else ""
+        self._render_current_dir()
+
+    def _on_row_activated(self):
+        entry = self._selected_entry()
+        if not entry:
+            return
+        if entry["type"] == "up":
+            self._navigate_up()
+        elif entry["type"] == "dir":
+            self._navigate_into(entry["path"])
+        else:
+            self._view_selected()
+
     # ── Selection ────────────────────────────────────────────────────────────
 
-    def _on_selection(self):
-        has_sel = bool(self.table.selectedItems())
-        self.btn_view.setEnabled(has_sel)
-        self.btn_delete.setEnabled(has_sel)
-
-    def _selected_path(self):
+    def _selected_entry(self):
         row = self.table.currentRow()
         if row < 0:
             return None
-        return self.table.item(row, 0).text()
+        item = self.table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _on_selection(self):
+        entry = self._selected_entry()
+        is_file = entry is not None and entry["type"] == "file"
+        self.btn_view.setEnabled(is_file)
+        self.btn_delete.setEnabled(is_file)
+
+    def _selected_path(self):
+        entry = self._selected_entry()
+        if entry and entry["type"] == "file":
+            return entry["path"]
+        return None
+
 
     # ── View / edit ──────────────────────────────────────────────────────────
 
@@ -372,19 +470,21 @@ class DepotFilesTab(QWidget):
     # ── Upload ───────────────────────────────────────────────────────────────
 
     def _upload_file(self):
-        build_id = self.project_combo.currentData()
+        build_id = self.mw.current_build_id()
         if not build_id:
-            QMessageBox.warning(self, "Ошибка", "Выберите сборку")
+            QMessageBox.warning(self, "Ошибка", "Выберите сборку вверху окна")
             return
         local_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл для загрузки")
         if not local_path:
             return
-        default_rel = Path(local_path).name
-        rel_path = default_rel  # простая схема — кладём в корень сборки,
-        # для произвольного пути внутри дерева переименуйте/переместите
-        # локально перед выбором либо используйте «🚀 Релизы» для
-        # обычной публикации сборки — эта кнопка для отдельных файлов
-        # (readme, poster.png и т.п.), не для чанков.
+        # Кладём в ТЕКУЩУЮ открытую папку (см. "Навигация по папкам" в
+        # докстринге модуля) — раньше всегда только в корень сборки. Для
+        # произвольного пути внутри дерева переименуйте/переместите
+        # локально перед выбором либо используйте «🚀 Релизы» для обычной
+        # публикации сборки — эта кнопка для отдельных файлов (readme,
+        # poster.png и т.п.), не для чанков.
+        name = Path(local_path).name
+        rel_path = f"{self._current_dir}/{name}" if self._current_dir else name
 
         client = self._make_client(build_id)
         data = Path(local_path).read_bytes()

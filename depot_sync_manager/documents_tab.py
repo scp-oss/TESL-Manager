@@ -64,7 +64,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QComboBox, QTableWidget, QTableWidgetItem,
+    QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QMessageBox, QFileDialog,
     QInputDialog,
 )
@@ -143,16 +143,13 @@ class DocumentsTab(QWidget):
 
         conn_box = QGroupBox("Сборка")
         conn_row = QHBoxLayout(conn_box)
-        conn_row.addWidget(QLabel("Сборка:"))
-        self.project_combo = QComboBox()
-        self.project_combo.setMinimumWidth(200)
-        conn_row.addWidget(self.project_combo)
-        btn_refresh = QPushButton("🔄")
-        btn_refresh.setFixedWidth(36)
-        btn_refresh.clicked.connect(self._refresh_projects)
-        conn_row.addWidget(btn_refresh)
+        self.build_hint_label = QLabel("Сборка не выбрана")
+        conn_row.addWidget(self.build_hint_label)
         conn_row.addStretch()
-        hint = QLabel("Общие на всю сборку — не привязаны к конкретному компоненту")
+        hint = QLabel(
+            "Сборка выбирается вверху окна. Общие на всю сборку — не "
+            "привязаны к конкретному компоненту"
+        )
         hint.setStyleSheet("color: #888; font-size: 9pt;")
         conn_row.addWidget(hint)
         root.addWidget(conn_box)
@@ -217,7 +214,7 @@ class DocumentsTab(QWidget):
         patch_layout.addWidget(self.patch_table)
         root.addWidget(patch_box)
 
-        self.status_label = QLabel("Выберите сборку и нажмите «Показать»")
+        self.status_label = QLabel("Выберите сборку вверху окна и нажмите «Показать»")
         self.status_label.setStyleSheet("font-size: 9pt; color: #888;")
         root.addWidget(self.status_label)
 
@@ -237,41 +234,38 @@ class DocumentsTab(QWidget):
         )
 
     def _current_client(self):
-        build_id = self.project_combo.currentData()
+        build_id = self.mw.current_build_id()
         if not build_id:
             return None
         return self._make_client(build_id)
 
+    def _update_build_hint(self):
+        name = self.mw.current_build_name()
+        self.build_hint_label.setText(f"Сборка: {name}" if name else "Сборка не выбрана")
+
     def showEvent(self, event):
         super().showEvent(event)
-        if self.project_combo.count() == 0:
-            self._refresh_projects()
-            # Тот же принцип, что и в depot_files_tab.py (см. её CLAUDE.md
-            # "Файлы на сервере пустая после успешной публикации") — по
-            # умолчанию сразу выбираем сборку публикации, а не первую по
-            # алфавиту, и сразу показываем содержимое без лишнего клика.
-            if self.project_combo.currentData():
-                self._load_documents()
-                self._load_patches()
+        self._update_build_hint()
+        if self.doc_table.rowCount() == 0 and self.patch_table.rowCount() == 0 and self.mw.current_build_id():
+            self._load_documents()
+            self._load_patches()
 
-    def _refresh_projects(self):
-        cfg = self._panel_cfg()
-        if not cfg.get("base_url"):
-            self.status_label.setText("⚠️ Сначала настройте URL панели/токен на странице «⚙️ Настройки»")
+    def on_build_changed(self):
+        """MainWindow._notify_build_changed() — см. main_window.py. Тот же
+        принцип, что и в depot_files_tab.py::on_build_changed() — сбрасываем
+        содержимое (относилось к предыдущей сборке) и перезагружаем сразу,
+        только если страница реально видна."""
+        self._update_build_hint()
+        self.doc_table.setRowCount(0)
+        self.patch_table.setRowCount(0)
+        if not self.mw.current_build_id():
+            self.status_label.setText("Сборка не выбрана — выберите её вверху окна")
             return
-        client = self._make_client("")
-        builds = client.list_builds()
-        client.close()
-        current_id = self.project_combo.currentData()
-        self.project_combo.clear()
-        for b in builds:
-            self.project_combo.addItem(b["name"], b["id"])
-        if not current_id:
-            current_id = cfg.get("build_id") or None
-        if current_id:
-            idx = self.project_combo.findData(current_id)
-            if idx >= 0:
-                self.project_combo.setCurrentIndex(idx)
+        if self.isVisible():
+            self._load_documents()
+            self._load_patches()
+        else:
+            self.status_label.setText("Выберите сборку вверху окна и нажмите «Показать»")
 
     # ── Документы ────────────────────────────────────────────────────────────
 
