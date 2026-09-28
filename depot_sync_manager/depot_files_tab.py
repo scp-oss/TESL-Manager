@@ -35,14 +35,83 @@ MAX_INLINE_EDIT_BYTES) и декодируемых как UTF-8 файлов, т
 был плоским (полный относительный путь текстом в каждой строке,
 `packs/pack-00001.bin`), неудобно при реалистичном количестве файлов
 (`chunks/` в неупакованном режиме — сотни/тысячи записей). Теперь
-`_FolderView` строит дерево из плоского списка `[{"path","size"}]",
-показывает содержимое ТЕКУЩЕЙ папки (по умолчанию — корень): подпапки
-первой (📁, агрегированный размер+число файлов), затем файлы этой же
-папки (📄, реальный размер); двойной клик по папке входит в неё, кнопка
-"⬆ .." (и двойной клик по ней же) — уровнем выше. Строка пути (хлебная
-крошка) над таблицей показывает, где сейчас находимся. Выбор/просмотр/
-удаление одного файла (`_selected_path()` и всё, что от него зависит)
-работают только на строках-ФАЙЛАХ — на папке эти кнопки недоступны.
+`_render_current_dir()` строит дерево из плоского списка
+`[{"path","size"}]`, показывает содержимое ТЕКУЩЕЙ папки (по умолчанию —
+корень): подпапки первой (📁, агрегированный размер+число файлов), затем
+файлы этой же папки (📄, реальный размер); двойной клик по папке входит
+в неё, кнопка "⬆ .." (и двойной клик по ней же) — уровнем выше. Строка
+пути (хлебная крошка) над таблицей показывает, где сейчас находимся.
+Выбор/просмотр/удаление одного файла (`_selected_path()` и всё, что от
+него зависит) работают только на строках-ФАЙЛАХ — на папке эти кнопки
+недоступны.
+
+## Группировка по компонентам + "как на скачанном клиенте" (2026-09-28)
+
+Прямой запрос: "файлы на сервере должно выглядеть так (в зависимости от
+включённых чекбоксов) skyrim mo2p mo2ext patchs, служебные файлы можно
+не отображать, а содержимое папок должно выглядеть как на скачанном
+клиенте, чтобы можно было добавлять/удалять/редактировать файлы внутри".
+
+**Источник данных — теперь ДВА, не один**, сведённые в один и тот же
+`self._files_cache` (дерево не различает происхождение записи, кроме
+типа строки, см. ниже):
+1. `client.list_files()` (как и раньше) — реальные, не чанкованные
+   файлы (`documents/`/`patch/`/`patchs/`) — полный CRUD (просмотр/
+   правка/удаление/загрузка) не изменился, это и есть "выглядит как на
+   скачанном клиенте" для них: имя файла = реальный путь на диске.
+2. **Новое**: `DepotSyncManager.fetch_remote_manifest()` (тот же вызов,
+   что уже делает `depot_tab.py::_fetch_server_info()`/
+   `_refresh_release_info()`) — `depot_manifest.json`, `.files` —
+   СЛОВАРЬ логических путей вида `"Skyrim/Data/Skyrim.esm"`
+   (компонентный префикс + оригинальный относительный путь, см.
+   `chunk_manager.py::scan_components()` — это ровно то, что реально
+   лежит на диске у игрока после установки, никакого отношения к
+   `chunks/<xx>/<id>`/`packs/pack-NNNNN.bin` не имеет). Даёт группы
+   `Skyrim/`/`MO2p/`/`MO2ext/` в дереве — та самая "как на скачанном
+   клиенте" структура, а не сырое хранилище.
+
+**Служебные файлы скрыты полностью** — `_SERVICE_PREFIXES`/
+`_SERVICE_PATHS` (см. ниже) исключают `chunks/`, `packs/`, `versions/`,
+`chunk_index.db`, `depot.json`, `depot_manifest.json`,
+`extras_manifest.json`, `poster.png` из `self._files_cache` целиком —
+их не видно ни в корне, ни как отдельные "папки". Постер по-прежнему
+управляется своей собственной секцией на "🚀 Релизы" (см. её же
+CLAUDE.md-запись), документы/патчи/файлы патчей — своей страницей "📄
+Документы и патчи" (эта же информация теперь ЗЕРКАЛЬНО видна и здесь,
+одно СОСТОЯНИЕ, два способа посмотреть).
+
+**"В зависимости от включённых чекбоксов"**: группа `Skyrim`/`MO2p`/
+`MO2ext` появляется в дереве, только если в РЕАЛЬНО ОПУБЛИКОВАННОМ
+манифесте (`depot_manifest.json`, не в локальном, ещё не отправленном
+состоянии чекбоксов на "🚀 Релизы") есть хотя бы один файл с этим
+префиксом — то есть отражает то, что компонент был включён на момент
+ПОСЛЕДНЕЙ публикации, а не текущее (возможно ещё не опубликованное)
+положение чекбокса в `ComponentRow`. Выбран этот источник истины, а не
+локальный чекбокс, намеренно: показывать пустую группу "Skyrim" только
+потому, что чекбокс сейчас включён локально, но сборка с Skyrim ещё ни
+разу не публиковалась — не то же самое, что "выглядит как на скачанном
+клиенте" (клиент ничего не скачал, пока публикации не было).
+
+**Компонентные файлы (Skyrim/MO2p/MO2ext) — ТОЛЬКО ДЛЯ ЧТЕНИЯ в этом
+представлении**, сознательное и явно объявленное ограничение, не
+недоделка: реальные байты файла разбиты на content-addressed чанки,
+переиспользуемые МЕЖДУ файлами (дедуп) — "отредактировать один файл
+удалённо" физически означало бы: перечитать его чанки (это решаемо,
+логика уже существует в `recover_from_chunks.py`/`ChunkInstaller`'а
+эквиваленте), но "заменить" — заново нарезать новый контент на чанки и
+аккуратно обновить `chunk_index.db`/pack-файлы/манифест НЕ ломая другие
+файлы, которые делят те же чанки — это, по сути, заново реализовать
+кусок паблиш-пайплайна, только в обратную сторону и без тех же
+гарантий/тестов, что уже есть у `execute_sync_packed()`. Правильный и
+уже полностью работающий путь изменить файл внутри Skyrim/MO2p/MO2ext —
+поменять его в ЛОКАЛЬНОЙ папке компонента (та, что настроена на "🚀
+Релизы") и нажать "📦 Собрать и опубликовать" ещё раз — delta-механизм
+загрузит только реально изменившееся. Строки таких файлов показываются
+с 🔒 (не 📄) и задизейбленными "Просмотреть"/"Удалить" — при попытке
+выбрать такую строку статус-бар прямо объясняет это же, а не просто
+молча отключает кнопки. `documents/`/`patch/`/`patchs/` под это
+ограничение НЕ попадают — они не чанкованы вообще, полный CRUD как и
+раньше.
 """
 from pathlib import Path
 
@@ -57,6 +126,25 @@ from PyQt6.QtGui import QFont
 
 MAX_INLINE_EDIT_BYTES = 256 * 1024
 
+# Компоненты, чьи логические файлы (не сырые chunk-объекты) показываются
+# как папки верхнего уровня — та же тройка, что и "Компоненты сборки" на
+# "🚀 Релизы" (config.py::COMPONENT_NAMES), но своя копия здесь: список
+# путей строится из depot_manifest.json, а не из локального чекбокс-
+# конфига, см. докстринг модуля "В зависимости от включённых чекбоксов".
+COMPONENT_GROUPS = ("Skyrim", "MO2p", "MO2ext")
+
+# Служебные объекты хранилища — никогда не показываются в этом дереве
+# (см. докстринг модуля "Служебные файлы скрыты полностью").
+_SERVICE_PATHS = {
+    "depot.json", "depot_manifest.json", "chunk_index.db",
+    "extras_manifest.json", "poster.png",
+}
+_SERVICE_PREFIXES = ("chunks/", "packs/", "versions/")
+
+
+def _is_service_path(path: str) -> bool:
+    return path in _SERVICE_PATHS or path.startswith(_SERVICE_PREFIXES)
+
 
 def _fmt_size(n: int) -> str:
     for u in ("B", "KB", "MB", "GB", "TB"):
@@ -69,19 +157,33 @@ def _fmt_size(n: int) -> str:
 # ── Worker'ы ──────────────────────────────────────────────────────────────────
 
 class _ListWorker(QObject):
-    finished = pyqtSignal(list)
+    # (raw_files, manifest_files_dict_or_None) — manifest_files — то, что
+    # реально лежало в depot_manifest.json на момент запроса ({"Skyrim/
+    # Data/Skyrim.esm": size, ...}), уже готовое к слиянию с raw_files, а
+    # не сырой DepotManifest (тот содержит ChunkInfo-списки, объекты Qt
+    # не должны пересекать границу потока без необходимости).
+    finished = pyqtSignal(list, object)
     error    = pyqtSignal(str)
 
-    def __init__(self, client):
+    def __init__(self, client, manifest_cfg: dict = None):
         super().__init__()
         self.client = client
+        self.manifest_cfg = manifest_cfg
 
     def run(self):
         files = self.client.list_files()
         if files is None:
             self.error.emit("Не удалось получить список файлов (проверьте проект/токен)")
-        else:
-            self.finished.emit(files)
+            return
+        manifest_files = None
+        if self.manifest_cfg is not None:
+            from depot_sync_manager import DepotSyncManager
+            sync = DepotSyncManager(self.manifest_cfg)
+            manifest = sync.fetch_remote_manifest()
+            sync.close()
+            if manifest is not None:
+                manifest_files = {path: entry.size for path, entry in manifest.files.items()}
+        self.finished.emit(files, manifest_files)
 
 
 class _UploadWorker(QObject):
@@ -322,7 +424,14 @@ class DepotFilesTab(QWidget):
         name = self.mw.current_build_name()
         self.status_label.setText(f"Загружаем список файлов сборки «{name}»…")
 
-        self._worker = _ListWorker(self._client)
+        # manifest_cfg — минимальный конфиг, которого достаточно
+        # DepotSyncManager.fetch_remote_manifest() (только backend+panel,
+        # см. её же __init__/_rp() — remote_path пуст для panel-бэкенда).
+        # Тот же вызов, что уже делает depot_tab.py для "Текущий релиз"/
+        # "Инфо с сервера" — здесь нужен ради компонентных групп
+        # Skyrim/MO2p/MO2ext, см. докстринг модуля.
+        manifest_cfg = {"backend": "panel", "panel": {**cfg, "build_id": build_id}}
+        self._worker = _ListWorker(self._client, manifest_cfg)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._worker.finished.connect(self._on_loaded)
@@ -330,10 +439,22 @@ class DepotFilesTab(QWidget):
         self._thread.started.connect(self._worker.run)
         self._thread.start()
 
-    def _on_loaded(self, files: list):
+    def _on_loaded(self, files: list, manifest_files: dict):
         self._cleanup_thread()
         self._set_busy(False)
-        self._files_cache = files
+        # Служебные объекты хранилища (chunks/packs/versions/depot*.json/
+        # chunk_index.db/extras_manifest.json/poster.png) — никогда в этом
+        # дереве, см. докстринг модуля "Служебные файлы скрыты полностью".
+        # Компонентные (Skyrim/MO2p/MO2ext) записи из depot_manifest.json —
+        # помечены отдельно (component=True), т.к. они read-only (см. тот
+        # же докстринг, "Компонентные файлы... ТОЛЬКО ДЛЯ ЧТЕНИЯ").
+        visible = [
+            {"path": f["path"], "size": f["size"], "component": False}
+            for f in files if not _is_service_path(f["path"])
+        ]
+        for path, size in (manifest_files or {}).items():
+            visible.append({"path": path, "size": size, "component": True})
+        self._files_cache = visible
         # Папка, в которой мы были (если это не первая загрузка), сохраняется —
         # обновление/удаление одного файла не должно выбрасывать обратно в
         # корень, см. докстринг модуля "Навигация по папкам". Если её больше
@@ -341,13 +462,18 @@ class DepotFilesTab(QWidget):
         # _render_current_dir() просто покажет пустое содержимое с рабочей
         # кнопкой "⬆ Вверх", а не упадёт.
         self._render_current_dir()
-        total_size = sum(e["size"] for e in files)
-        self.status_label.setText(f"Файлов: {len(files)}   Общий размер: {_fmt_size(total_size)}")
-        self.log_message.emit(f"✅ Файлы депо: {len(files)} ({_fmt_size(total_size)})")
+        total_size = sum(e["size"] for e in visible)
+        self.status_label.setText(f"Файлов: {len(visible)}   Общий размер: {_fmt_size(total_size)}")
+        self.log_message.emit(f"✅ Файлы депо: {len(visible)} ({_fmt_size(total_size)})")
 
     def _on_error(self, msg: str):
         self._cleanup_thread()
         self._set_busy(False)
+        # _set_busy(False) сбросило btn_upload обратно на "включено" —
+        # ниже она может тут же быть неверной, если ошибка произошла,
+        # пока мы были внутри read-only-папки компонента (см. её же
+        # проверку в _render_current_dir()) — переоценим сразу.
+        self.btn_upload.setEnabled(not self._current_dir_is_component())
         self.status_label.setText(f"❌ {msg}")
         self.log_message.emit(f"❌ {msg}")
 
@@ -371,11 +497,20 @@ class DepotFilesTab(QWidget):
                 continue
             if "/" in rest:
                 name = rest.split("/", 1)[0]
-                agg = dirs.setdefault(name, {"count": 0, "size": 0})
+                agg = dirs.setdefault(name, {"count": 0, "size": 0, "component": True})
                 agg["count"] += 1
                 agg["size"] += entry["size"]
+                # Папка read-only, только если ВСЕ файлы внутри неё
+                # компонентные — смешения не бывает на практике (компонентные
+                # префиксы Skyrim/MO2p/MO2ext никогда не пересекаются с
+                # documents/patch/patchs), но на всякий случай считаем это
+                # честно, а не жёстко по имени папки.
+                agg["component"] = agg["component"] and entry.get("component", False)
             else:
-                files_here.append({"name": rest, "path": path, "size": entry["size"]})
+                files_here.append({
+                    "name": rest, "path": path, "size": entry["size"],
+                    "component": entry.get("component", False),
+                })
 
         self.table.setRowCount(0)
         self.breadcrumb_label.setText(f"📂 {self._current_dir}" if self._current_dir else "📂 / (корень)")
@@ -394,8 +529,9 @@ class DepotFilesTab(QWidget):
             row = self.table.rowCount()
             self.table.insertRow(row)
             full_path = f"{self._current_dir}/{name}" if self._current_dir else name
-            item = QTableWidgetItem(f"📁 {name}/")
-            item.setData(Qt.ItemDataRole.UserRole, {"type": "dir", "path": full_path})
+            icon = "🔒📁" if agg["component"] else "📁"
+            item = QTableWidgetItem(f"{icon} {name}/")
+            item.setData(Qt.ItemDataRole.UserRole, {"type": "dir", "path": full_path, "component": agg["component"]})
             self.table.setItem(row, 0, item)
             count_word = "файл" if agg["count"] % 10 == 1 and agg["count"] % 100 != 11 else "файлов"
             self.table.setItem(row, 1, QTableWidgetItem(f"{_fmt_size(agg['size'])} ({agg['count']} {count_word})"))
@@ -403,13 +539,22 @@ class DepotFilesTab(QWidget):
         for f in sorted(files_here, key=lambda e: e["name"]):
             row = self.table.rowCount()
             self.table.insertRow(row)
-            item = QTableWidgetItem(f"📄 {f['name']}")
-            item.setData(Qt.ItemDataRole.UserRole, {"type": "file", "path": f["path"]})
+            icon = "🔒" if f["component"] else "📄"
+            item = QTableWidgetItem(f"{icon} {f['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, {
+                "type": "file_ro" if f["component"] else "file",
+                "path": f["path"],
+            })
             self.table.setItem(row, 0, item)
             size_item = QTableWidgetItem(_fmt_size(f["size"]))
             size_item.setData(Qt.ItemDataRole.UserRole, f["size"])
             self.table.setItem(row, 1, size_item)
 
+        # "Загрузить файл…" отражает read-only-статус ТЕКУЩЕЙ папки заранее
+        # (не только отказывает постфактум внутри _upload_file(), см. её же
+        # проверку ниже) — иначе кнопка выглядела бы доступной прямо
+        # посреди read-only-дерева, а нажатие всё равно ничего не делало бы.
+        self.btn_upload.setEnabled(not self._current_dir_is_component())
         self._on_selection()
 
     def _navigate_into(self, path: str):
@@ -431,8 +576,13 @@ class DepotFilesTab(QWidget):
             self._navigate_up()
         elif entry["type"] == "dir":
             self._navigate_into(entry["path"])
-        else:
+        elif entry["type"] == "file":
             self._view_selected()
+        else:  # "file_ro" — двойной клик по компонентному файлу ничего не
+            # открывает (нет байтов, которые можно было бы честно
+            # показать/сохранить, см. докстринг модуля) — просто
+            # обновляем статус-бар тем же текстом, что и обычный клик.
+            self._on_selection()
 
     # ── Selection ────────────────────────────────────────────────────────────
 
@@ -448,12 +598,27 @@ class DepotFilesTab(QWidget):
         is_file = entry is not None and entry["type"] == "file"
         self.btn_view.setEnabled(is_file)
         self.btn_delete.setEnabled(is_file)
+        if entry is not None and entry["type"] == "file_ro":
+            self.status_label.setText(
+                "🔒 Файл компонента сборки — доступен только для чтения здесь. "
+                "Чтобы изменить: поменяйте его в локальной папке компонента "
+                "и опубликуйте сборку заново («🚀 Релизы»)."
+            )
 
     def _selected_path(self):
         entry = self._selected_entry()
         if entry and entry["type"] == "file":
             return entry["path"]
         return None
+
+    def _current_dir_is_component(self) -> bool:
+        """Похож ли текущий путь на компонентную подпапку (Skyrim/MO2p/
+        MO2ext или что-то внутри них) — используется, чтобы запретить
+        загрузку файла ВНУТРЬ read-only-дерева (см. _upload_file())."""
+        if not self._current_dir:
+            return False
+        head = self._current_dir.split("/", 1)[0]
+        return head in COMPONENT_GROUPS
 
 
     # ── View / edit ──────────────────────────────────────────────────────────
@@ -473,6 +638,15 @@ class DepotFilesTab(QWidget):
         build_id = self.mw.current_build_id()
         if not build_id:
             QMessageBox.warning(self, "Ошибка", "Выберите сборку вверху окна")
+            return
+        if self._current_dir_is_component():
+            QMessageBox.warning(
+                self, "Только для чтения",
+                f"«{self._current_dir}» — компонент сборки, доступен только для "
+                f"чтения (см. подсказку при выборе файла). Чтобы добавить файл — "
+                f"положите его в локальную папку компонента и опубликуйте "
+                f"сборку заново («🚀 Релизы»).",
+            )
             return
         local_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл для загрузки")
         if not local_path:
