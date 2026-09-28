@@ -25,7 +25,7 @@ from typing import Dict
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QComboBox, QProgressBar, QMessageBox,
+    QPushButton, QComboBox, QProgressBar, QMessageBox, QFileDialog,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -34,9 +34,21 @@ from chunk_manager import DEFAULT_CHUNK_SIZE, DepotManifest, DepotDelta
 from depot_sync_manager import DepotBuildWorker, DepotSyncManager
 from depot_confirm_dialog import DepotConfirmDialog
 from release_tab import ComponentRow
+from depot_files_tab import _fmt_size
 from config import COMPONENT_NAMES, DEFAULT_COMPONENTS_CONFIG
 
 CHANNELS = ["stable", "beta", "dev"]
+
+# Постер сборки (2026-09-28, прямой запрос) — обложка, показываемая где-то
+# у потребителя (лаунчер/панель, ещё не решено кем именно на момент этой
+# правки) при выборе сборки. Фиксированное имя, а не то, что выбрал
+# оператор локально (как у обычной "⬆ Загрузить файл…" на "Файлы на
+# сервере") — чтобы потребителю не нужно было ничего парсить/угадывать,
+# просто GET того же самого пути у любой сборки. Формат не проверяется/не
+# конвертируется на этой стороне (PNG/JPEG — оба валидны, содержимое
+# просто кладётся под этим именем как есть) — любой декодер изображений
+# определяет формат по содержимому, не по расширению.
+POSTER_PATH = "poster.png"
 
 # "depot_tab" — ключ конфига под компоненты/канал этой страницы (имя
 # оставлено историческим ради обратной совместимости с уже сохранённым
@@ -76,11 +88,13 @@ class DepotTab(QWidget):
         if not self._release_info_shown:
             self._release_info_shown = True
             self._refresh_release_info()
+            self._refresh_poster_status()
 
     def on_build_changed(self):
         """Вызывается MainWindow._notify_build_changed() при любом изменении
         глобального выбора сборки (верхняя панель окна, см. main_window.py)."""
         self._refresh_release_info()
+        self._refresh_poster_status()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -94,6 +108,20 @@ class DepotTab(QWidget):
         # "Глобальный выбор сборки"), не отдельно на каждой странице — раньше
         # здесь был свой build_combo с полным управлением (создать/удалить/
         # переименовать), перенесён туда без изменений в самой логике.
+
+        # ── Постер сборки ─────────────────────────────────────────────────────
+        poster_box = QGroupBox("🖼 Постер сборки")
+        poster_row = QHBoxLayout(poster_box)
+        self.poster_status_label = QLabel("Постер: —")
+        poster_row.addWidget(self.poster_status_label, stretch=1)
+        btn_poster_upload = QPushButton("🖼 Загрузить…")
+        btn_poster_upload.clicked.connect(self._upload_poster)
+        poster_row.addWidget(btn_poster_upload)
+        self.btn_poster_remove = QPushButton("🗑 Удалить")
+        self.btn_poster_remove.setEnabled(False)
+        self.btn_poster_remove.clicked.connect(self._remove_poster)
+        poster_row.addWidget(self.btn_poster_remove)
+        root.addWidget(poster_box)
 
         # ── Компоненты сборки (Skyrim / MO2p / MO2ext) ──────────────────────
         comp_box = QGroupBox("Компоненты сборки")
@@ -245,14 +273,78 @@ class DepotTab(QWidget):
         return self.mw.current_build_id()
 
     def _make_client(self, panel_cfg: dict, build_id: str = ""):
-        # Всё ещё нужен здесь для _fetch_server_info() (коммит панели, не
-        # завязан на конкретную сборку) — управление самими сборками
+        # Нужен здесь для _fetch_server_info() (коммит панели, не завязан на
+        # конкретную сборку) и для постера ниже — управление самими сборками
         # (создание/переименование/удаление) переехало в MainWindow.
         from panel_client import PanelHTTP
         return PanelHTTP(
             base_url=panel_cfg.get("base_url", ""), build_id=build_id,
             token=panel_cfg.get("token", ""), verify_ssl=panel_cfg.get("verify_ssl", True),
         )
+
+    # ── Постер сборки ─────────────────────────────────────────────────────────
+    # Обычный файл под фиксированным путём POSTER_PATH внутри сборки — тот же
+    # generic PUT/GET/DELETE PanelHTTP, что уже используют depot_files_tab.py/
+    # documents_tab.py для documents/patch (только для backend="panel" —
+    # у WebDAV нет отдельного понятия "постер", тут не реализовано).
+
+    def _refresh_poster_status(self):
+        cfg = self._backend_cfg()
+        build_id = self._current_build_id()
+        if cfg["backend"] != "panel" or not build_id or not cfg["panel"].get("base_url"):
+            self.poster_status_label.setText("Постер: сборка не выбрана")
+            self.btn_poster_remove.setEnabled(False)
+            return
+        client = self._make_client(cfg["panel"], build_id)
+        data = client.get_bytes(POSTER_PATH)
+        client.close()
+        if data is None:
+            self.poster_status_label.setText("Постер: не загружен")
+            self.btn_poster_remove.setEnabled(False)
+        else:
+            self.poster_status_label.setText(f"Постер: загружен ({_fmt_size(len(data))})")
+            self.btn_poster_remove.setEnabled(True)
+
+    def _upload_poster(self):
+        cfg = self._backend_cfg()
+        build_id = self._current_build_id()
+        if cfg["backend"] != "panel" or not build_id:
+            QMessageBox.warning(self, "Ошибка", "Сначала выберите сборку вверху окна (backend — TESL-Panel)")
+            return
+        local_path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите изображение постера", "", "Изображения (*.png *.jpg *.jpeg)"
+        )
+        if not local_path:
+            return
+        data = Path(local_path).read_bytes()
+        client = self._make_client(cfg["panel"], build_id)
+        ok = client.put(POSTER_PATH, data, content_type="image/png")
+        client.close()
+        if ok:
+            self._log(f"✅ Постер сборки загружен ({_fmt_size(len(data))})")
+            self._refresh_poster_status()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Не удалось загрузить постер")
+
+    def _remove_poster(self):
+        cfg = self._backend_cfg()
+        build_id = self._current_build_id()
+        if not build_id:
+            return
+        ans = QMessageBox.question(
+            self, "Удаление постера", "Удалить постер сборки?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        client = self._make_client(cfg["panel"], build_id)
+        ok = client.delete_object(POSTER_PATH)
+        client.close()
+        if ok:
+            self._log("🗑 Постер сборки удалён")
+            self._refresh_poster_status()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Не удалось удалить постер")
 
     def _save_components(self):
         cfg = self._get_config()
