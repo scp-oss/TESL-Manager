@@ -251,6 +251,29 @@ class PanelHTTP:
         except Exception:
             return None
 
+    def check_storage_capacity(self, bytes_needed: int) -> Optional[dict]:
+        """Хватит ли места на разделе, к которому физически привязана
+        ТЕКУЩАЯ (`self.build_id`) сборка, чтобы залить `bytes_needed`
+        новых байт — `GET /api/depot/<build_id>/storage-check?bytes=N`.
+        Прямой запрос пользователя после реального ENOSPC-инцидента
+        2026-09-29 ("после определения файлов и их объёма надо добавить
+        сверку с свободным местом в кластере") — проверка ДО начала
+        заливки, не постфактум по оборванному PUT. Возвращает
+        `{"ok","reachable","free","needed","path"}` или `None` на любую
+        ошибку (best-effort — сетевой сбой здесь не должен блокировать
+        саму попытку публикации, только выключает предупреждение)."""
+        try:
+            r = self.session.get(
+                f"{self.base_url}/api/depot/{self.build_id}/storage-check",
+                params={"bytes": bytes_needed},
+                timeout=TIMEOUT_CONNECT,
+            )
+            if r.status_code == 200:
+                return r.json()
+            return None
+        except Exception:
+            return None
+
     def get_next_build_storage_target(self) -> Optional[str]:
         """Куда физически ляжет СЛЕДУЮЩАЯ новая сборка — `GET
         /api/storage/next`, зовёт на панели ТОТ ЖЕ

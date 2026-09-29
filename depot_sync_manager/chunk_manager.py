@@ -485,6 +485,33 @@ class DepotDelta:
         return ", ".join(parts) if parts else "нет изменений"
 
 
+def compute_upload_bytes(new_manifest: "DepotManifest", delta: "DepotDelta") -> int:
+    """Сколько РЕАЛЬНО новых байт нужно залить на сервер — сумма размеров
+    УНИКАЛЬНЫХ чанков из delta.chunks_to_upload (не весь объём сборки — на
+    уже существующие/переиспользуемые чанки место на сервере не нужно).
+    Вынесено сюда из depot_confirm_dialog.py (где раньше жила единственная
+    копия этого подсчёта) 2026-09-29, чтобы depot_tab.py::_on_scan_done()
+    могла посчитать то же самое число для сверки со свободным местом на
+    сервере (прямой запрос пользователя после реального ENOSPC-инцидента)
+    — без второй, отдельно поддерживаемой копии того же цикла.
+
+    Дедуп по chunk_id (`seen`) — прежний инлайн-вариант в
+    depot_confirm_dialog.py его не делал и мог посчитать один и тот же
+    НОВЫЙ чанк дважды, если он используется в двух разных новых/
+    изменённых файлах (дедуп чанков между файлами — штатная часть
+    протокола, см. pack_writer.py) — реальный объём заливки от этого
+    был бы завышен. Здесь это исправлено заодно."""
+    seen: set = set()
+    total = 0
+    for path in new_manifest.files:
+        entry = new_manifest.files[path]
+        for chunk in entry.chunks:
+            if chunk.chunk_id in delta.chunks_to_upload and chunk.chunk_id not in seen:
+                seen.add(chunk.chunk_id)
+                total += chunk.size
+    return total
+
+
 # ── ScanStats ─────────────────────────────────────────────────────────────────
 
 class ScanStats:

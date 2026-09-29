@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
 
-from chunk_manager import DepotManifest, DepotDelta
+from chunk_manager import DepotManifest, DepotDelta, compute_upload_bytes
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -99,14 +99,10 @@ class DepotConfirmDialog(QDialog):
             f"📦 Новых чанков к загрузке: <b>{len(d.chunks_to_upload)}</b>"
         )
 
-        # Считаем размер новых чанков
-        new_bytes = 0
-        for path in d.files_new + d.files_changed:
-            entry = nm.files.get(path)
-            if entry:
-                for chunk in entry.chunks:
-                    if chunk.chunk_id in d.chunks_to_upload:
-                        new_bytes += chunk.size
+        # Считаем размер новых чанков — общая функция с depot_tab.py's
+        # проверкой свободного места на сервере (compute_upload_bytes()),
+        # не отдельная копия того же цикла (см. её докстринг).
+        new_bytes = compute_upload_bytes(nm, d)
 
         if new_bytes:
             summary_text += f"<br>💾 Объём загрузки: <b>{_fmt_size(new_bytes)}</b>"
