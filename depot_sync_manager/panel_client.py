@@ -251,6 +251,26 @@ class PanelHTTP:
         except Exception:
             return None
 
+    def get_next_build_storage_target(self) -> Optional[str]:
+        """Куда физически ляжет СЛЕДУЮЩАЯ новая сборка — `GET
+        /api/storage/next`, зовёт на панели ТОТ ЖЕ
+        `storage_cluster.pick_member_for_new_build()`, что реально
+        использует `create_build()`. Прямой запрос пользователя
+        2026-09-29 ("добавь в менеджер отображение куда уйдёт сборка") —
+        не пересчитываем "у кого сейчас больше свободного места" здесь
+        же (это бы дублировало ту же логику в двух местах — см. свой
+        же докстринг get_storage_info() за то, почему это плохая идея в
+        этом проекте), просто спрашиваем панель напрямую. None на любую
+        ошибку — best-effort, как и остальной этот транспорт."""
+        try:
+            r = self.session.get(f"{self.base_url}/api/storage/next", timeout=TIMEOUT_CONNECT)
+            if r.status_code == 200:
+                path = r.json().get("path")
+                return str(path) if path else None
+            return None
+        except Exception:
+            return None
+
     # ── Сборки / файлы (для GUI: серверный список/создание/удаление/
     #    переименование сборок и вкладка "Файлы на сервере" — см.
     #    TESL-Panel::panel/app.py /api/builds и /api/depot/<build_id>/files,

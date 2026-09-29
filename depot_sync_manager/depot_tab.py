@@ -489,17 +489,24 @@ class DepotTab(QWidget):
             # докстринг) — панель сама решает, куда лечь НОВОЙ сборке.
             storage_members = client.get_storage_info()
             if storage_members:
+                # Прямой запрос "добавь в менеджер отображение куда уйдёт
+                # сборка" — спрашиваем панель напрямую (не пересчитываем
+                # "у кого сейчас больше места" здесь же, см.
+                # get_next_build_storage_target()'s докстринг), помечаем
+                # ⭐ у той строки, что реально совпала.
+                next_target = client.get_next_build_storage_target()
                 lines = ["💾 Хранилище (кластер):"]
                 for m in storage_members:
+                    mark = " ⭐ (сюда ляжет следующая сборка)" if m.get("path") == next_target else ""
                     if not m.get("reachable", True):
-                        lines.append(f"  {m.get('path', '?')} — ⚠️ недоступен")
+                        lines.append(f"  {m.get('path', '?')} — ⚠️ недоступен{mark}")
                         continue
                     free_gb = m.get("free", 0) / 1073741824
                     total_gb = m.get("total", 0) / 1073741824
                     pct = m.get("percent", 0)
                     lines.append(
                         f"  {m.get('path', '?')} — свободно {free_gb:.1f} ГБ "
-                        f"из {total_gb:.1f} ГБ ({pct}% занято)"
+                        f"из {total_gb:.1f} ГБ ({pct}% занято){mark}"
                     )
                 panel_line += "\n".join(lines) + "\n\n"
 
