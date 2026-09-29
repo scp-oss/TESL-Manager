@@ -233,6 +233,24 @@ class PanelHTTP:
         except Exception:
             return None
 
+    def get_storage_info(self) -> Optional[List[dict]]:
+        """[{"path","reachable","free","total","used","percent"}, ...] —
+        кластер мест хранения панели (`GET /api/storage`, публичный, см.
+        TESL-Panel::storage_cluster.py). Прямой запрос пользователя
+        2026-09-29 ("в менеджере тоже отображение") — ЧИСТО информационный
+        дисплей, менеджер здесь НИЧЕГО не выбирает: панель сама решает,
+        на какой раздел лечь НОВАЯ сборка (`pick_member_for_new_build()`),
+        по прямому выбору пользователя ("какая разница где хранить чанки,
+        главное последовательная запись на HDD"). None на любую ошибку —
+        best-effort, как и get_server_info()."""
+        try:
+            r = self.session.get(f"{self.base_url}/api/storage", timeout=TIMEOUT_CONNECT)
+            if r.status_code == 200:
+                return list(r.json().get("members", []))
+            return None
+        except Exception:
+            return None
+
     # ── Сборки / файлы (для GUI: серверный список/создание/удаление/
     #    переименование сборок и вкладка "Файлы на сервере" — см.
     #    TESL-Panel::panel/app.py /api/builds и /api/depot/<build_id>/files,

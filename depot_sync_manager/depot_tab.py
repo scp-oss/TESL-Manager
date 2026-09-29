@@ -483,6 +483,26 @@ class DepotTab(QWidget):
             if server_info:
                 panel_line = f"🖥 TESL-Panel: коммит {server_info.get('commit', '?')}\n\n"
 
+            # Кластер хранения (2026-09-29, прямой запрос "в менеджере
+            # тоже отображение") — ЧИСТО информационно, менеджер здесь
+            # ничего не выбирает (см. panel_client.py::get_storage_info()'s
+            # докстринг) — панель сама решает, куда лечь НОВОЙ сборке.
+            storage_members = client.get_storage_info()
+            if storage_members:
+                lines = ["💾 Хранилище (кластер):"]
+                for m in storage_members:
+                    if not m.get("reachable", True):
+                        lines.append(f"  {m.get('path', '?')} — ⚠️ недоступен")
+                        continue
+                    free_gb = m.get("free", 0) / 1073741824
+                    total_gb = m.get("total", 0) / 1073741824
+                    pct = m.get("percent", 0)
+                    lines.append(
+                        f"  {m.get('path', '?')} — свободно {free_gb:.1f} ГБ "
+                        f"из {total_gb:.1f} ГБ ({pct}% занято)"
+                    )
+                panel_line += "\n".join(lines) + "\n\n"
+
         sync = DepotSyncManager(cfg)
         manifest = sync.fetch_remote_manifest()
         sync.close()
