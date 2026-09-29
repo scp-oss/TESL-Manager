@@ -58,11 +58,30 @@ class PackWriter:
     загрузку на сервер делает вызывающий код (DepotSyncManager), эта
     прослойка не знает про сеть вообще, как и chunk_manager.py."""
 
-    def __init__(self, out_dir: Path, pack_size: int = DEFAULT_PACK_SIZE):
+    def __init__(self, out_dir: Path, pack_size: int = DEFAULT_PACK_SIZE, start_index: int = 0):
+        """
+        `start_index` — живой инцидент 2026-09-29: без него КАЖДЫЙ вызов
+        начинает нумерацию заново с `pack-00001.bin`, независимо от того,
+        сколько pack-файлов уже реально лежит на сервере с прошлых
+        публикаций ЭТОЙ сборки. Второй (и любой следующий) публикация
+        поверх уже существующего chunk_index.db тогда СОВПАДАЕТ именами
+        со старыми pack-файлами — `storage.put_bytes()` на TESL-Panel
+        просто заменяет файл по пути, никакой защиты от коллизии имён
+        нет — и старые записи `chunk_locations`, всё ещё указывающие на
+        `pack-00001.bin` по СТАРЫМ offset/size, начинают читать байты из
+        СОВЕРШЕННО ДРУГОГО (перезаписанного) файла: sha256 не совпадёт
+        (данные другие) либо Range выйдет за пределы нового файла (416,
+        если он оказался короче старого). Живой прогон это подтвердил
+        буквально: 1846 `sha256_mismatch` + 174 `http_416` на 2020 отказов
+        из 2120 нужных чанков — почти все чанки, упакованные не в
+        последнюю публикацию. См. `execute_sync_packed()` — вызывающий
+        код обязан передать сюда максимальный номер уже занятого pack-а
+        (из уже смёрженного `existing_index`), не ноль.
+        """
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.pack_size = pack_size
-        self._pack_index = 0
+        self._pack_index = start_index
         self._cur_file = None
         self._cur_path: Path = None
         self._cur_offset = 0

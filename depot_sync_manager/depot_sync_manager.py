@@ -15,6 +15,7 @@ DepotSyncManager — сетевой слой depot-системы.
 
 import os
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -823,7 +824,22 @@ class DepotSyncManager(QObject):
                             chunk_source[chunk.chunk_id] = (path, chunk.offset, chunk.size)
 
                 self.log.emit(f"📦 Упаковываем {total} чанков ({self.pack_size / 1024 / 1024:.1f}MB/pack)…")
-                pw = PackWriter(pack_dir / "out", pack_size=self.pack_size)
+                # Живой инцидент 2026-09-29 — см. PackWriter.__init__'s
+                # докстринг за полную картину: без start_index новая
+                # публикация начинает нумерацию pack-файлов с 1 заново и
+                # МОЛЧА перезаписывает уже опубликованные pack-N.bin с
+                # прошлых публикаций этой же сборки, на которые всё ещё
+                # ссылаются старые записи chunk_index.db (existing_index
+                # выше) — 87% чанков реальной установки развалились
+                # именно так (sha256_mismatch/416). Продолжаем нумерацию
+                # с максимального уже занятого номера, а не с нуля.
+                _pack_re = re.compile(r"^pack-(\d+)\.bin$")
+                max_existing_pack = 0
+                for pack_name, _off, _size in existing_index.values():
+                    m = _pack_re.match(pack_name)
+                    if m:
+                        max_existing_pack = max(max_existing_pack, int(m.group(1)))
+                pw = PackWriter(pack_dir / "out", pack_size=self.pack_size, start_index=max_existing_pack)
                 done = 0
                 # Прогресс с процентом/скоростью/ETA — та же схема
                 # сглаживания, что у скана (chunk_manager.py::
