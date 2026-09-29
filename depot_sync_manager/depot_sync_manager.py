@@ -18,6 +18,7 @@ import json
 import re
 import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -823,7 +824,6 @@ class DepotSyncManager(QObject):
                         if chunk.chunk_id in delta.chunks_to_upload:
                             chunk_source[chunk.chunk_id] = (path, chunk.offset, chunk.size)
 
-                self.log.emit(f"📦 Упаковываем {total} чанков ({self.pack_size / 1024 / 1024:.1f}MB/pack)…")
                 # Живой инцидент 2026-09-29 — см. PackWriter.__init__'s
                 # докстринг за полную картину: без start_index новая
                 # публикация начинает нумерацию pack-файлов с 1 заново и
@@ -839,21 +839,115 @@ class DepotSyncManager(QObject):
                     m = _pack_re.match(pack_name)
                     if m:
                         max_existing_pack = max(max_existing_pack, int(m.group(1)))
-                pw = PackWriter(pack_dir / "out", pack_size=self.pack_size, start_index=max_existing_pack)
-                done = 0
-                # Прогресс с процентом/скоростью/ETA — та же схема
-                # сглаживания, что у скана (chunk_manager.py::
-                # scan_directory) и заливки ниже (прямой запрос
-                # пользователя, 2026-09-24: "ета для хешинга всё ещё
-                # нет" — этап упаковки страдал тем же самым).
+
+                # Живой инцидент 2026-09-29 — "[Errno 28] No space left on
+                # device" при упаковке реальной ~171GB-сборки: раньше ВСЯ
+                # публикация ПОЛНОСТЬЮ упаковывалась на локальный диск
+                # (pack_dir, обычно системный TEMP) и только ПОТОМ начиналась
+                # заливка — то есть локально должна была поместиться вся
+                # сборка целиком, прежде чем на сервер уходил хоть один
+                # байт. Теперь пакуем и заливаем ОДНИМ потоковым конвейером
+                # (PackWriter.on_pack_complete, см. pack_writer.py) — каждый
+                # готовый pack-файл уходит на сервер и удаляется локально
+                # сразу же, не дожидаясь конца упаковки. upload_sem
+                # ограничивает, сколько ещё не улетевших pack-файлов может
+                # одновременно лежать на диске (число воркеров + 1 про
+                # запас) — если заливка отстаёт от упаковки (медленный канал
+                # на крупной сборке — ровно тот случай, что уронил
+                # публикацию), упаковка следующего pack'а просто ждёт
+                # свободного места в очереди, а не копит их безгранично.
                 total_pack_bytes = sum(
                     chunk_source[cid][2] for cid in delta.chunks_to_upload
                     if cid in chunk_source
                 )
-                packed_bytes = 0
+                uploaded_bytes = 0
+                state_lock = threading.Lock()
                 last_sample_t = time.time()
-                last_sample_bytes = 0
+                last_sample_uploaded = 0
                 smoothed_speed = 0.0
+                error_holder: List[str] = []     # первая ошибка — останавливает всё
+                stopped_holder: List[bool] = []  # пользователь нажал "Стоп"
+
+                max_upload_workers = UPLOAD_WORKERS_PACKS_SSD if self.disk_mode == "ssd" else 1
+                upload_pool = ThreadPoolExecutor(max_workers=max_upload_workers)
+                upload_sem = threading.Semaphore(max_upload_workers + 1)
+
+                def _report_progress():
+                    nonlocal last_sample_t, last_sample_uploaded, smoothed_speed
+                    now = time.time()
+                    sample_dt = now - last_sample_t
+                    if sample_dt >= 0.5:
+                        inst = (uploaded_bytes - last_sample_uploaded) / sample_dt
+                        alpha = 0.3
+                        smoothed_speed = inst if smoothed_speed == 0 else (
+                            alpha * inst + (1 - alpha) * smoothed_speed)
+                        last_sample_t = now
+                        last_sample_uploaded = uploaded_bytes
+                    pct = int(uploaded_bytes / total_pack_bytes * 100) if total_pack_bytes else 100
+                    bytes_remaining = total_pack_bytes - uploaded_bytes
+                    eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
+                    self.progress.emit(
+                        int(uploaded_bytes), int(total_pack_bytes),
+                        f"{pct}% — 📦⬆ {smoothed_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
+                    )
+
+                def _upload_one(pp: Path) -> None:
+                    nonlocal uploaded_bytes
+                    try:
+                        if error_holder or stopped_holder:
+                            return
+                        ok = self._retry_until_recovered(
+                            lambda: dav.put_file(self._rp(PACKS_DIR, pp.name), pp),
+                            dav, stop_fn, pp.name,
+                        )
+                        if not ok:
+                            with state_lock:
+                                if not error_holder:
+                                    error_holder.append(
+                                        f"Не удалось загрузить {pp.name}: {dav.last_error or 'см. лог'}"
+                                    )
+                            return
+                        size = pp.stat().st_size
+                        try:
+                            pp.unlink()
+                        except OSError:
+                            pass
+                        with state_lock:
+                            uploaded_bytes += size
+                        self.log.emit(f"  ✅ {pp.name} ({size // 1024} KB)")
+                        _report_progress()
+                    except Exception as e:
+                        with state_lock:
+                            if not error_holder:
+                                error_holder.append(f"Ошибка заливки {pp.name}: {e}")
+                    finally:
+                        upload_sem.release()
+
+                def _on_pack_ready(pp: Path) -> None:
+                    # Вызывается PackWriter'ом из потока упаковки (см.
+                    # pack_writer.py::on_pack_complete) — синхронно блокирует
+                    # ЕГО, пока не освободится место в очереди заливки, это
+                    # и есть весь смысл backpressure.
+                    if error_holder or (stop_fn and stop_fn()):
+                        if not stopped_holder:
+                            stopped_holder.append(True)
+                        return
+                    upload_sem.acquire()
+                    if error_holder or (stop_fn and stop_fn()):
+                        upload_sem.release()
+                        if not stopped_holder:
+                            stopped_holder.append(True)
+                        return
+                    upload_pool.submit(_upload_one, pp)
+
+                self.log.emit(
+                    f"📦 Упаковываем и заливаем {total} чанков "
+                    f"({self.pack_size / 1024 / 1024:.1f}MB/pack, режим: {self.disk_mode.upper()})…"
+                )
+                pw = PackWriter(
+                    pack_dir / "out", pack_size=self.pack_size, start_index=max_existing_pack,
+                    on_pack_complete=_on_pack_ready,
+                )
                 # sorted() — тот же порядок, в котором лаунчер и так
                 # запрашивает чанки (см. TESL/core/chunk_installer.py) —
                 # упаковка в этом же порядке и есть весь смысл схемы
@@ -861,7 +955,10 @@ class DepotSyncManager(QObject):
                 # надежда на ФС).
                 for cid in sorted(delta.chunks_to_upload):
                     if stop_fn and stop_fn():
-                        return False, "Остановлено пользователем"
+                        stopped_holder.append(True)
+                        break
+                    if error_holder:
+                        break
                     if pause_fn:
                         pause_fn()
                     src = chunk_source.get(cid)
@@ -875,114 +972,16 @@ class DepotSyncManager(QObject):
                             data = f.read(size)
                         pw.add_chunk(cid, data)
                     except Exception as e:
-                        return False, f"Ошибка чтения {rel_path} при упаковке: {e}"
-                    done += 1
-                    packed_bytes += size
+                        error_holder.append(f"Ошибка чтения {rel_path} при упаковке: {e}")
+                        break
 
-                    now = time.time()
-                    sample_dt = now - last_sample_t
-                    if sample_dt >= 0.5:
-                        inst = (packed_bytes - last_sample_bytes) / sample_dt
-                        alpha = 0.3
-                        smoothed_speed = inst if smoothed_speed == 0 else (
-                            alpha * inst + (1 - alpha) * smoothed_speed)
-                        last_sample_t = now
-                        last_sample_bytes = packed_bytes
-                    pct = int(packed_bytes / total_pack_bytes * 100) if total_pack_bytes else 100
-                    bytes_remaining = total_pack_bytes - packed_bytes
-                    eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
-                    self.progress.emit(
-                        done, total,
-                        f"{pct}% — 📦 {smoothed_speed / 1024 / 1024:.1f} MB/s — "
-                        f"осталось: {eta} — {cid[:12]}…"
-                    )
                 pw.finalize()
+                upload_pool.shutdown(wait=True)
 
-                self.log.emit(
-                    f"📤 Загружаем {len(pw.pack_paths)} pack-файл(ов) "
-                    f"(режим: {self.disk_mode.upper()})…"
-                )
-                # Прогресс-бар "как в лаунчере" (прямой запрос пользователя,
-                # 2026-09-23) — та же схема сглаживания, что в execute_sync()
-                # выше, по гранулярности pack-файлов (нет byte-level
-                # callback'а внутри dav.put_file()).
-                total_upload_bytes = sum(p.stat().st_size for p in pw.pack_paths)
-                uploaded_bytes = 0
-                last_sample_t = time.time()
-                last_sample_uploaded = 0
-                smoothed_speed = 0.0
-
-                def _report_progress():
-                    nonlocal last_sample_t, last_sample_uploaded, smoothed_speed
-                    now = time.time()
-                    sample_dt = now - last_sample_t
-                    if sample_dt >= 0.5:
-                        inst = (uploaded_bytes - last_sample_uploaded) / sample_dt
-                        alpha = 0.3
-                        smoothed_speed = inst if smoothed_speed == 0 else (
-                            alpha * inst + (1 - alpha) * smoothed_speed)
-                        last_sample_t = now
-                        last_sample_uploaded = uploaded_bytes
-                    pct = int(uploaded_bytes / total_upload_bytes * 100) if total_upload_bytes else 100
-                    bytes_remaining = total_upload_bytes - uploaded_bytes
-                    eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
-                    self.progress.emit(
-                        int(uploaded_bytes), int(total_upload_bytes),
-                        f"{pct}% — ⬆ {smoothed_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
-                    )
-
-                if self.disk_mode == "ssd":
-                    # SSD: параллельная заливка (UPLOAD_WORKERS_PACKS_SSD
-                    # потоков) — диск не боится конкурентной записи в
-                    # разные файлы, узкое место — сеть/CPU. requests.Session
-                    # у dav (см. NextcloudDAV/PanelHTTP) уже настроен под
-                    # конкурентные запросы (тот же паттерн, что и per-chunk
-                    # протокол execute_sync() выше, тоже параллельный через
-                    # тот же dav).
-                    # Ошибка захватывается ЗДЕСЬ (dav.last_error читается
-                    # сразу после своего put_file(), в том же вызове) — а
-                    # не в главном потоке после future.result(), потому что
-                    # dav один на все потоки-загрузчики: если читать
-                    # last_error снаружи, к этому моменту его может уже
-                    # перезаписать ДРУГОЙ, ещё выполняющийся future.
-                    def _upload_one_pack(pp: Path) -> Tuple[str, bool, int, str]:
-                        ok = self._retry_until_recovered(
-                            lambda: dav.put_file(self._rp(PACKS_DIR, pp.name), pp),
-                            dav, stop_fn, pp.name,
-                        )
-                        return pp.name, ok, pp.stat().st_size, dav.last_error
-
-                    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS_PACKS_SSD) as pool:
-                        futures = {pool.submit(_upload_one_pack, pp): pp for pp in pw.pack_paths}
-                        for future in as_completed(futures):
-                            if stop_fn and stop_fn():
-                                pool.shutdown(wait=False, cancel_futures=True)
-                                return False, "Остановлено пользователем"
-                            name, ok, pack_size, err = future.result()
-                            if not ok:
-                                pool.shutdown(wait=False, cancel_futures=True)
-                                return False, f"Не удалось загрузить {name}: {err or 'см. лог'}"
-                            uploaded_bytes += pack_size
-                            self.log.emit(f"  ✅ {name} ({pack_size // 1024} KB)")
-                            _report_progress()
-                else:
-                    # HDD: строго последовательно, один PUT за раз — см.
-                    # CLAUDE.md "Алгоритм заливки под SSD/HDD" за полное
-                    # обоснование (random-write penalty на вращающемся
-                    # диске при параллельной записи в разные файлы).
-                    for pack_path in pw.pack_paths:
-                        if stop_fn and stop_fn():
-                            return False, "Остановлено пользователем"
-                        ok = self._retry_until_recovered(
-                            lambda: dav.put_file(self._rp(PACKS_DIR, pack_path.name), pack_path),
-                            dav, stop_fn, pack_path.name,
-                        )
-                        if not ok:
-                            return False, f"Не удалось загрузить {pack_path.name}: {dav.last_error or 'см. лог'}"
-                        pack_size = pack_path.stat().st_size
-                        uploaded_bytes += pack_size
-                        self.log.emit(f"  ✅ {pack_path.name} ({pack_size // 1024} KB)")
-                        _report_progress()
+                if error_holder:
+                    return False, error_holder[0]
+                if stopped_holder:
+                    return False, "Остановлено пользователем"
 
                 merged = {**existing_index, **pw.locations}
                 index_path = pack_dir / CHUNK_INDEX_NAME

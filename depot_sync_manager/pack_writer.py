@@ -43,7 +43,7 @@ except ImportError:
     # того, с чем был собран системный Python.
     import pysqlite3 as sqlite3
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # Живой инцидент (2026-09-24): исходный DEFAULT_PACK_SIZE=256MB и
 # HDD_PACK_SIZE=1GB (первая версия этого файла) реально сломали
@@ -73,8 +73,36 @@ class PackWriter:
     загрузку на сервер делает вызывающий код (DepotSyncManager), эта
     прослойка не знает про сеть вообще, как и chunk_manager.py."""
 
-    def __init__(self, out_dir: Path, pack_size: int = DEFAULT_PACK_SIZE, start_index: int = 0):
+    def __init__(
+        self,
+        out_dir: Path,
+        pack_size: int = DEFAULT_PACK_SIZE,
+        start_index: int = 0,
+        on_pack_complete: Optional[Callable[[Path], None]] = None,
+    ):
         """
+        `on_pack_complete` — живой инцидент 2026-09-29: без него ВСЕ
+        pack-файлы целой публикации пишутся на локальный диск (обычно
+        `tempfile.mkdtemp()`, то есть системный TEMP — часто МЕНЬШИЙ по
+        объёму диск, чем тот, где реально лежат исходники) и только
+        ПОСЛЕ ТОГО, как упаковка ПОЛНОСТЬЮ закончится, начинается
+        заливка (см. execute_sync_packed()) — то есть для крупной сборки
+        (реальный случай: 174977 файлов, 157091 новых чанков) локально
+        должна поместиться ВСЯ сборка целиком, прежде чем на сервер уйдёт
+        хоть один байт. Живой инцидент: "[Errno 28] No space left on
+        device" при упаковке ~171GB-сборки — диск, на котором лежит
+        системный TEMP, оказался меньше суммарного объёма сборки.
+        Callback вызывается с уже ЗАКРЫТЫМ файлом каждого только что
+        завершённого pack'а (и с финальным — из finalize()) —
+        вызывающий код (execute_sync_packed()) грузит его на сервер и
+        удаляет локально немедленно, так что на диске одновременно лежит
+        не вся сборка, а максимум несколько pack-файлов (столько, сколько
+        в моменте не успело улететь на сервер) — независимо от того,
+        сколько всего чанков в публикации. `None` (по умолчанию) —
+        поведение НЕ меняется вообще: все pack-файлы остаются на диске
+        до explicit finalize(), как раньше (обратная совместимость для
+        существующих тестов/CLI, которым это не нужно).
+
         `start_index` — живой инцидент 2026-09-29: без него КАЖДЫЙ вызов
         начинает нумерацию заново с `pack-00001.bin`, независимо от того,
         сколько pack-файлов уже реально лежит на сервере с прошлых
@@ -100,6 +128,7 @@ class PackWriter:
         self._cur_file = None
         self._cur_path: Path = None
         self._cur_offset = 0
+        self.on_pack_complete = on_pack_complete
         # chunk_id -> (pack_filename, offset, size) — только чанки,
         # добавленные ЭТИМ вызовом PackWriter (новые для этой публикации);
         # слияние со старым индексом с прошлых публикаций — забота
@@ -108,7 +137,13 @@ class PackWriter:
         self.pack_paths: List[Path] = []
 
     def _open_new_pack(self) -> None:
+        prev_path = self._cur_path
         self._close_current_file()
+        # Предыдущий pack (если был) только что закрыт и больше не
+        # пишется — самое время его выгрузить/удалить, если вызывающий
+        # код это делает (см. on_pack_complete в докстринге __init__).
+        if prev_path is not None and self.on_pack_complete is not None:
+            self.on_pack_complete(prev_path)
         self._pack_index += 1
         name = f"pack-{self._pack_index:05d}.bin"
         self._cur_path = self.out_dir / name
@@ -135,7 +170,14 @@ class PackWriter:
         self._cur_offset += len(data)
 
     def finalize(self) -> None:
+        """Закрывает и (если задан on_pack_complete) сдаёт ПОСЛЕДНИЙ
+        ещё не сданный pack — все предыдущие уже прошли через
+        _open_new_pack() выше, этот единственный не имел "следующего"
+        пака, который бы его закрыл раньше."""
+        last_path = self._cur_path
         self._close_current_file()
+        if last_path is not None and self.on_pack_complete is not None:
+            self.on_pack_complete(last_path)
 
 
 def write_chunk_index_db(
