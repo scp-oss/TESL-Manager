@@ -36,7 +36,13 @@
 """
 
 import json
-import sqlite3
+try:
+    import sqlite3
+except ImportError:
+    # См. pack_writer.py за полное обоснование (живой инцидент
+    # 2026-09-29) — тот же паттерн во всех трёх местах этого
+    # репозитория, где встречается bare `import sqlite3`.
+    import pysqlite3 as sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path

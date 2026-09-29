@@ -2147,6 +2147,35 @@ pack-файлов уже в `existing_index` (`pack-(\d+)\.bin`) и переда
 что даже пустой `chunk_index.db` не заставит переупаковать файлы, чьё
 локальное содержимое не изменилось с прошлой публикации.
 
+## `pack_writer.py`/`db.py`/`build_manifest_db.py` — тот же `_sqlite3`-фолбэк, что уже в TESL-Panel (2026-09-29)
+
+Найдено при реальном прогоне сквозного интеграционного теста TESL-Panel
+(см. её CLAUDE.md/`tests/integration/`) ПРЯМО на продакшен-сервере
+панели: `ModuleNotFoundError: No module named '_sqlite3'` на
+`pack_writer.py`'s bare `import sqlite3`. Тот же класс проблемы, что уже
+чинился в TESL-Panel::`builds_db.py` — Python на этом сервере собран из
+исходников без C-расширения `_sqlite3` (нужен `libsqlite3-dev` в системе
+НА МОМЕНТ сборки интерпретатора). Обычно этот код исполняется
+оператором на Windows (там `sqlite3` в stdlib есть всегда) — сценарий
+"этот код работает на такой Linux-машине" раньше не возникал вообще, до
+интеграционного теста (сам тест запускает `depot_sync_manager.*` в
+подпроцессе через `sys.executable` — интерпретатор ТЕСТА, не отдельное
+окружение TESL-Manager).
+
+Все три места этого репозитория с bare `import sqlite3`
+(`pack_writer.py`, `db.py`, `build_manifest_db.py`) получили тот же
+`try: import sqlite3 / except ImportError: import pysqlite3 as
+sqlite3`, что уже был в `builds_db.py` панели — `pysqlite3-binary`
+добавлен в `requirements.txt`. Публичная сигнатура ни одной функции не
+менялась — только `try/except` вокруг самого импорта.
+
+Проверено: `sys.modules['sqlite3'] = None` (форсирует `ImportError` на
+`import sqlite3`, тот же приём, каким это уже проверялось в
+TESL-Panel) → `pack_writer.py` реально подхватывает `pysqlite3`,
+`write_chunk_index_db()`/`read_chunk_index_db()` работают идентично.
+Полный сквозной тест (см. TESL-Panel) прошёл без регрессий на обычном
+Python (со штатным `_sqlite3`).
+
 ## Стиль
 
 PyQt6, `QThread` + `moveToThread`, сигналы `pyqtSignal` для логов/прогресса/`finished`.

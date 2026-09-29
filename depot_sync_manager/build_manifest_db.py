@@ -51,7 +51,13 @@
 
 import argparse
 import json
-import sqlite3
+try:
+    import sqlite3
+except ImportError:
+    # См. pack_writer.py за полное обоснование этого fallback'а (живой
+    # инцидент 2026-09-29) — держим тот же паттерн во всех трёх местах
+    # этого репозитория, где встречается bare `import sqlite3`.
+    import pysqlite3 as sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path

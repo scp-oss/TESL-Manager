@@ -26,7 +26,22 @@ WebDAV — 155290 уникальных чанков = 155290 отдельных 
     истины "где физически лежит этот chunk_id" для читающей стороны
     (TESL-Panel Range-GET, будущий launcher-side reader).
 """
-import sqlite3
+try:
+    import sqlite3
+except ImportError:
+    # Живой инцидент 2026-09-29, найден при запуске сквозного
+    # интеграционного теста (см. TESL-Panel::tests/integration/) прямо
+    # на сервере панели — тот же класс проблемы, что уже чинился в
+    # TESL-Panel::builds_db.py: Python на этом сервере собран из
+    # исходников без `_sqlite3` (C-расширение, нужен `libsqlite3-dev` в
+    # системе НА МОМЕНТ сборки интерпретатора). Обычно TESL-Manager
+    # запускается оператором на Windows, где `sqlite3` в stdlib есть
+    # всегда — этот путь актуален только когда его код (как здесь,
+    # через подпроцесс интеграционного теста) исполняется на ТАКОМ
+    # Linux-сервере. Тот же fallback: `pysqlite3-binary` — самодостаточное
+    # wheel со своим статически слинкованным libsqlite3, не зависит от
+    # того, с чем был собран системный Python.
+    import pysqlite3 as sqlite3
 from pathlib import Path
 from typing import Dict, List, Tuple
 
