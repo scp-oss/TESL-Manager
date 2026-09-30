@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
-from chunk_manager import DEFAULT_CHUNK_SIZE, DepotManifest, DepotDelta, compute_upload_bytes
+from chunk_manager import DEFAULT_CHUNK_SIZE, DepotManifest, DepotDelta
 from depot_sync_manager import DepotBuildWorker, DepotSyncManager
 from depot_confirm_dialog import DepotConfirmDialog
 from release_tab import ComponentRow
@@ -599,44 +599,13 @@ class DepotTab(QWidget):
         self._pending_manifest = new_manifest
         self._pending_delta    = delta
 
-        # Сверка со свободным местом на сервере ДО показа диалога
-        # подтверждения — прямой запрос пользователя после реального
-        # ENOSPC-инцидента 2026-09-29 ("после определения файлов и их
-        # объёма надо добавить сверку с свободным местом в кластере").
-        # Публикация физически привязана к ОДНОМУ разделу (storage_root
-        # этой сборки, не всему кластеру целиком — новую сборку кластер
-        # выбирает сам, но эта уже существует), поэтому спрашиваем именно
-        # про него, не про максимум по кластеру. best-effort: сетевой сбой
-        # самой проверки (client.check_storage_capacity() вернёт None) не
-        # блокирует публикацию — так и было раньше, до этой проверки.
-        cfg = self._build_runtime_config()
-        if cfg["backend"] == "panel":
-            new_bytes = compute_upload_bytes(new_manifest, delta)
-            if new_bytes:
-                client = self._make_client(cfg["panel"], cfg["panel"].get("build_id", ""))
-                check = client.check_storage_capacity(new_bytes)
-                if check and check.get("reachable", True) and not check.get("ok", True):
-                    free_gb = check.get("free", 0) / 1073741824
-                    needed_gb = new_bytes / 1073741824
-                    path = check.get("path", "?")
-                    self._log(
-                        f"⚠️ На разделе {path} свободно {free_gb:.1f} ГБ, "
-                        f"публикации нужно ~{needed_gb:.1f} ГБ"
-                    )
-                    reply = QMessageBox.warning(
-                        self, "Недостаточно места на сервере",
-                        f"На разделе, куда физически ложится эта сборка ({path}), "
-                        f"свободно {free_gb:.1f} ГБ, а публикации нужно ~{needed_gb:.1f} ГБ "
-                        f"новых данных.\n\nПродолжить всё равно? Публикация почти "
-                        f"наверняка оборвётся с ошибкой на середине — тот же класс сбоя, "
-                        f"что уже случался (\"No space left on device\").",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No,
-                    )
-                    if reply != QMessageBox.StandardButton.Yes:
-                        self._log("⏹ Публикация отменена — недостаточно места на сервере")
-                        self._on_finished(False, "Отменено — недостаточно места на сервере")
-                        return
+        # Сверка/авто-выбор подходящего раздела кластера уже произошли
+        # РАНЬШЕ, на фоновом потоке сканирующего воркера (см.
+        # DepotBuildWorker.run() в depot_sync_manager.py, прямой запрос
+        # пользователя 2026-09-29) — до этой точки scan_done вообще не
+        # долетел бы, если бы подходящего места не нашлось (воркер сам
+        # завершился бы через finished.emit(False, ...)). Здесь эту
+        # проверку заново не делаем.
 
         # try/except — тот же живой случай, что в main.py::_install_crash_handler
         # (2026-09-23, крэш без следа при публикации большой сборки): это

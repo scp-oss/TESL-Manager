@@ -34,6 +34,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from chunk_manager import (
     ChunkManager, DepotManifest, DepotDelta, FileEntry, ChunkInfo,
     CHUNKS_DIR, VERSIONS_DIR, DEPOT_META, DEFAULT_CHUNK_SIZE,
+    compute_upload_bytes,
 )
 from pack_writer import (
     PackWriter, DEFAULT_PACK_SIZE, HDD_PACK_SIZE,
@@ -1207,6 +1208,46 @@ class DepotBuildWorker(ThreadSafeWorker):
             prev_entries = prev_manifest.files if prev_manifest else {}
             delta = cm.compute_delta(entries, prev_entries, remote_chunks)
             self.log.emit(f"📋 Delta: {delta.summary()}")
+
+            # Сверка/авто-выбор подходящего раздела кластера ДО показа
+            # диалога подтверждения — прямой запрос пользователя после
+            # реального ENOSPC-инцидента 2026-09-29 ("считает объём
+            # заливки и автоматически выбирает подходящий кластер, если
+            # нет подходящего — пишет нет подходящего"). Панель сама
+            # переключает storage_root сборки на другой член кластера,
+            # если текущему не хватает места (без физического переноса
+            # уже опубликованных данных — см. TESL-Panel::CLAUDE.md) —
+            # здесь только один быстрый HTTP-запрос, не polling/ожидание:
+            # реассайн указателя в БД мгновенный, никакой долгой фоновой
+            # операции на панели с этой правки уже нет.
+            if cfg.get("backend") == "panel" and not delta.is_empty:
+                new_bytes = compute_upload_bytes(new_manifest, delta)
+                if new_bytes:
+                    client = sync._get_dav()
+                    self.log.emit("📊 Проверяем место на сервере…")
+                    result = client.ensure_capacity(new_bytes)
+                    if result.get("ok"):
+                        if result.get("reassigned"):
+                            self.log.emit(
+                                f"↪️ Сборка переключена на другой раздел кластера: {result.get('path')}"
+                            )
+                    elif result.get("no_capacity"):
+                        self.log.emit(
+                            "❌ Нет подходящего раздела в кластере хранения — "
+                            f"нужно ~{new_bytes / 1073741824:.1f} ГБ, ни один "
+                            "член кластера столько не вмещает"
+                        )
+                        self.finished.emit(False, "Нет подходящего раздела в кластере хранения")
+                        return
+                    else:
+                        # Сетевая/иная ошибка самой проверки — НЕ best-effort
+                        # (см. ensure_capacity()'s докстринг): продолжать
+                        # публикацию с непроверенным объёмом места означало бы
+                        # рисковать тем же самым ENOSPC-инцидентом вслепую.
+                        err = result.get("error", "неизвестная ошибка")
+                        self.log.emit(f"❌ Не удалось проверить место на сервере: {err}")
+                        self.finished.emit(False, f"Не удалось проверить место на сервере: {err}")
+                        return
 
             self.scan_done.emit(new_manifest, delta, prev_manifest)
 

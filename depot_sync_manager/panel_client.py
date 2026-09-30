@@ -192,6 +192,41 @@ class PanelHTTP:
         except Exception:
             return set()
 
+    def ensure_capacity(self, bytes_needed: int) -> dict:
+        """`POST /api/depot/<build_id>/ensure-capacity?bytes=N` — прямой
+        запрос пользователя 2026-09-29 ("считает объём заливки и
+        автоматически выбирает подходящий кластер, если нет подходящего —
+        пишет нет подходящего"). Панель сама переставляет `storage_root`
+        сборки на подходящий член кластера, если текущему не хватает
+        места — БЕЗ физического переноса уже существующих данных (см.
+        TESL-Panel::CLAUDE.md за то, почему это сегодня безопасно и
+        почему полноценная миграция была написана и тем же вечером
+        откачена по прямому запросу пользователя: "миграцию можешь не
+        писать, потому что сборок залитых нет"). Панель сама откажет
+        (507), если у сборки на текущем разделе уже есть реальные данные,
+        которые реассайн осиротил бы — не полагаемся на клиент в этом
+        решении.
+
+        Возвращает разобранный JSON + `status_code`:
+          {"ok": True, "path": ..., "status_code": 200}          — места хватает (возможно, уже после переключения на другой раздел)
+          {"ok": False, "no_capacity": True, "status_code": 507} — НИ ОДИН член кластера не подходит (или подходящий есть, но сборку нельзя безопасно переключить)
+          {"ok": False, "error": "...", "status_code": None}     — сетевая ошибка — вызывающий код решает сам,
+                                                                     не best-effort здесь (в отличие от
+                                                                     get_storage_info()/get_server_info()) —
+                                                                     публикация не должна тихо продолжить
+                                                                     с непроверенным объёмом места."""
+        try:
+            r = self.session.post(
+                f"{self.base_url}/api/depot/{self.build_id}/ensure-capacity",
+                params={"bytes": bytes_needed},
+                timeout=TIMEOUT_CONNECT,
+            )
+            data = r.json() if r.content else {}
+            data["status_code"] = r.status_code
+            return data
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}", "status_code": None}
+
     def test_connection(self) -> Tuple[bool, str]:
         try:
             r = self.session.get(
@@ -247,29 +282,6 @@ class PanelHTTP:
             r = self.session.get(f"{self.base_url}/api/storage", timeout=TIMEOUT_CONNECT)
             if r.status_code == 200:
                 return list(r.json().get("members", []))
-            return None
-        except Exception:
-            return None
-
-    def check_storage_capacity(self, bytes_needed: int) -> Optional[dict]:
-        """Хватит ли места на разделе, к которому физически привязана
-        ТЕКУЩАЯ (`self.build_id`) сборка, чтобы залить `bytes_needed`
-        новых байт — `GET /api/depot/<build_id>/storage-check?bytes=N`.
-        Прямой запрос пользователя после реального ENOSPC-инцидента
-        2026-09-29 ("после определения файлов и их объёма надо добавить
-        сверку с свободным местом в кластере") — проверка ДО начала
-        заливки, не постфактум по оборванному PUT. Возвращает
-        `{"ok","reachable","free","needed","path"}` или `None` на любую
-        ошибку (best-effort — сетевой сбой здесь не должен блокировать
-        саму попытку публикации, только выключает предупреждение)."""
-        try:
-            r = self.session.get(
-                f"{self.base_url}/api/depot/{self.build_id}/storage-check",
-                params={"bytes": bytes_needed},
-                timeout=TIMEOUT_CONNECT,
-            )
-            if r.status_code == 200:
-                return r.json()
             return None
         except Exception:
             return None
