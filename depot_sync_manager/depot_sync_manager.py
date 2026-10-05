@@ -124,6 +124,47 @@ def _fmt_eta(seconds: float) -> str:
         return f"{m}м{s:02d}с"
     return f"{s}с"
 
+
+def _pack_upload_order(files: Dict[str, FileEntry], wanted: Set[str]) -> List[str]:
+    """Порядок упаковки новых чанков в pack-файлы: ПО ФАЙЛАМ манифеста
+    (по пути), внутри файла — по offset; чанк, уже встреченный в более
+    раннем файле (дедуп между файлами), не повторяется.
+
+    Живой разбор 2026-10-05 (реальный ladder-тест пользователя на проде,
+    134ГБ/157091 чанков/1455 pack): раньше чанки упаковывались в
+    sorted(chunk_id) — pack получался срезом хэш-пространства. Лаунчер
+    же с 2026-09-23 читает чанки ПО ФАЙЛАМ, не по хэшу (иначе память
+    росла до 9ГБ+ — см. TESL/core/chunk_installer.py::_plan_chunk_order)
+    — то есть каждый следующий запрос на установке бьёт в произвольный
+    pack. Замер подтвердил физику напрямую: последовательные Range-GET
+    держат 37-64 МБ/с на 1-24 потоках, а СЛУЧАЙНЫЕ при 24 потоках
+    проседают до 0.02 МБ/с с 77% запросов по ReadTimeout (конкурентные
+    случайные seek на HDD сервера интерферируют друг с другом —
+    чем больше потоков, тем хуже, не лучше). Это и есть измеренная
+    причина "500 МБ за 4 часа": porядок записи разошёлся с порядком
+    чтения.
+
+    При упаковке ПО ФАЙЛАМ чанки одного файла лежат в pack подряд —
+    лаунчер (детектирует раскладку сам, см. его собственный
+    `_pack_layout_is_file_ordered()`/`_plan_chunk_order_packed()`) при
+    такой раскладке читает pack последовательно, а не вразброс.
+
+    `wanted` — множество chunk_id к упаковке (delta.chunks_to_upload).
+    Чанки, которых нет ни в одном файле манифеста (не должно быть в
+    норме), дописываются в конец отсортированно — страховка, чтобы ни
+    один чанк не потерялся, даже если это предположение не выполнится."""
+    order: List[str] = []
+    seen: Set[str] = set()
+    for path in sorted(files):
+        for ch in sorted(files[path].chunks, key=lambda c: c.offset):
+            cid = ch.chunk_id
+            if cid in wanted and cid not in seen:
+                seen.add(cid)
+                order.append(cid)
+    order.extend(sorted(wanted - seen))
+    return order
+
+
 NC_PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:">
   <D:prop>
@@ -949,12 +990,14 @@ class DepotSyncManager(QObject):
                     pack_dir / "out", pack_size=self.pack_size, start_index=max_existing_pack,
                     on_pack_complete=_on_pack_ready,
                 )
-                # sorted() — тот же порядок, в котором лаунчер и так
-                # запрашивает чанки (см. TESL/core/chunk_installer.py) —
-                # упаковка в этом же порядке и есть весь смысл схемы
-                # (реальная последовательность на диске сервера, не
-                # надежда на ФС).
-                for cid in sorted(delta.chunks_to_upload):
+                # Порядок упаковки = порядок файлов манифеста (не
+                # sorted(chunk_id)) — лаунчер читает чанки по файлам
+                # (с 2026-09-23), упаковка в том же порядке даёт
+                # последовательное чтение pack-файлов на HDD сервера.
+                # См. _pack_upload_order() за полный разбор и измерение
+                # (живой ladder-тест 2026-10-05: random access на
+                # 24 потоках — 0.02 МБ/с, 77% ReadTimeout).
+                for cid in _pack_upload_order(new_manifest.files, delta.chunks_to_upload):
                     if stop_fn and stop_fn():
                         stopped_holder.append(True)
                         break
