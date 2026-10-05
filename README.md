@@ -83,6 +83,13 @@ cd depot_sync_manager
 python main.py
 ```
 
+На Windows для повседневного обновления+запуска — `update_and_run.bat` в
+корне репозитория: синкает чекаут на `origin/main` (`git fetch` +
+`git reset --hard`), печатает текущий коммит, затем запускает
+`depot_sync_manager/main.py`. Тот же паттерн, что у TESL's собственного
+`update_and_run.bat` — держать оба в синхронизации, если один из них
+меняется.
+
 Никаких секретов в коде нет — WebDAV-логин/пароль вводятся в UI (вкладка
 "⚙️ Настройки") и сохраняются локально в `%APPDATA%/Uploder/config.json`.
 
