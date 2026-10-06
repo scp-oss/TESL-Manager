@@ -851,6 +851,22 @@ class DepotSyncManager(QObject):
         pack_dir = Path(tempfile.mkdtemp(prefix="tesl_pack_"))
         try:
             if total > 0:
+                # Живой инцидент 2026-10-06: "нажимаю опубликовать, что-то
+                # куда-то грузится, но в прогресс-баре не отображается ни
+                # ETA, ни процент" — ВСЯ эта подготовительная секция (до
+                # первого реально упакованного/залитого pack-файла ниже,
+                # где уже есть _report_progress()) раньше не слала НИ
+                # ОДНОГО сигнала progress — только self.log.emit(), который
+                # идёт в текстовый лог, не в progress_label рядом с баром.
+                # На крупной сборке (174977 файлов/157091 чанков —
+                # реальный случай TESVAE_build-test) только построение
+                # chunk_source/_pack_upload_order() ниже — это чистый
+                # Python-проход по сотням тысяч записей, реально занимающий
+                # заметное время. total=0 здесь — сигнал для _on_progress()
+                # в depot_tab.py показать ТОЛЬКО текст этапа (бар остаётся
+                # indeterminate, он уже выставлен в _start_upload()), не
+                # голые "[0/0]".
+                self.progress.emit(0, 0, "📥 Скачиваем текущий chunk_index.db с сервера…")
                 self.log.emit("📥 Скачиваем текущий chunk_index.db (если есть)…")
                 existing_index: Dict[str, Tuple[str, int, int]] = {}
                 idx_bytes = dav.get_bytes(self._rp(CHUNK_INDEX_NAME))
@@ -860,6 +876,7 @@ class DepotSyncManager(QObject):
                     existing_index = read_chunk_index_db(tmp_idx)
                     self.log.emit(f"📋 В существующем индексе: {len(existing_index)} чанков")
 
+                self.progress.emit(0, 0, "🧮 Строим план упаковки (сопоставляем чанки с файлами)…")
                 chunk_source: Dict[str, Tuple[str, int, int]] = {}
                 for path, entry in new_manifest.files.items():
                     for chunk in entry.chunks:
@@ -982,22 +999,31 @@ class DepotSyncManager(QObject):
                         return
                     upload_pool.submit(_upload_one, pp)
 
-                self.log.emit(
-                    f"📦 Упаковываем и заливаем {total} чанков "
-                    f"({self.pack_size / 1024 / 1024:.1f}MB/pack, режим: {self.disk_mode.upper()})…"
-                )
-                pw = PackWriter(
-                    pack_dir / "out", pack_size=self.pack_size, start_index=max_existing_pack,
-                    on_pack_complete=_on_pack_ready,
-                )
                 # Порядок упаковки = порядок файлов манифеста (не
                 # sorted(chunk_id)) — лаунчер читает чанки по файлам
                 # (с 2026-09-23), упаковка в том же порядке даёт
                 # последовательное чтение pack-файлов на HDD сервера.
                 # См. _pack_upload_order() за полный разбор и измерение
                 # (живой ladder-тест 2026-10-05: random access на
-                # 24 потоках — 0.02 МБ/с, 77% ReadTimeout).
-                for cid in _pack_upload_order(new_manifest.files, delta.chunks_to_upload):
+                # 24 потоках — 0.02 МБ/с, 77% ReadTimeout). Проход по
+                # ВСЕМ файлам манифеста (174977 на реальной TESVAE) —
+                # сам по себе не бесплатный, отдельный чекпойнт прогресса
+                # ДО него, чтобы не было молчания до самого первого
+                # залитого pack-файла (см. живой инцидент 2026-10-06
+                # выше по файлу).
+                self.progress.emit(0, 0, "🧮 Упорядочиваем чанки по файлам для упаковки…")
+                upload_order = _pack_upload_order(new_manifest.files, delta.chunks_to_upload)
+
+                self.log.emit(
+                    f"📦 Упаковываем и заливаем {total} чанков "
+                    f"({self.pack_size / 1024 / 1024:.1f}MB/pack, режим: {self.disk_mode.upper()})…"
+                )
+                self.progress.emit(0, total_pack_bytes, f"📦 Упаковываем и заливаем {total} чанков…")
+                pw = PackWriter(
+                    pack_dir / "out", pack_size=self.pack_size, start_index=max_existing_pack,
+                    on_pack_complete=_on_pack_ready,
+                )
+                for cid in upload_order:
                     if stop_fn and stop_fn():
                         stopped_holder.append(True)
                         break

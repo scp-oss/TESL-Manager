@@ -689,7 +689,14 @@ class DepotTab(QWidget):
         if total > 0:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(current)
-        self.progress_label.setText(f"{msg}  [{current}/{total}]")
+            self.progress_label.setText(f"{msg}  [{current}/{total}]")
+        else:
+            # total=0 — промежуточный этап БЕЗ измеримого прогресса (скачивание
+            # chunk_index.db, построение плана упаковки на крупной сборке —
+            # см. execute_sync_packed()). Бар остаётся indeterminate (его
+            # setRange(0, 0) уже выставлен в _start_upload()), просто
+            # показываем текст этапа, а не голое "msg  [0/0]".
+            self.progress_label.setText(msg)
 
     def _on_finished(self, ok: bool, msg: str):
         self._cleanup_thread()
