@@ -16,9 +16,36 @@ mkcol() здесь — no-op (всегда True): панель создаёт р
 import base64
 import json
 import time
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 import requests
+
+
+class _ProgressReader:
+    """Обёртка над файловым объектом для put_file(progress_cb=...) —
+    прямой запрос пользователя 2026-10-06 ("на этом этапе нет ETA"):
+    без неё единственный сигнал прогресса на pack-файл приходил ПОСЛЕ
+    того, как ВЕСЬ PUT целиком завершался (см. CLAUDE.md "Прогресс-бар
+    публикации..." — для HDD-режима это один большой PUT за раз, 96MB,
+    строго последовательно), так что пока шёл именно этот один запрос —
+    прогресс-бар не двигался вообще, сколько бы он ни длился на
+    медленном канале. requests сам читает тело запроса через .read(N) в
+    цикле (см. urllib3/http.client) — делегируем всё файловому объекту
+    через __getattr__ (включая fileno()/tell()/seek(), которые requests
+    использует, чтобы определить Content-Length заранее), просто
+    сообщая progress_cb() о каждом прочитанном куске."""
+    def __init__(self, fileobj, progress_cb: Callable[[int], None]):
+        self._f = fileobj
+        self._cb = progress_cb
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._f.read(size)
+        if chunk:
+            self._cb(len(chunk))
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
 
 
 TIMEOUT_CONNECT = 15
@@ -150,12 +177,21 @@ class PanelHTTP:
             self.last_error = f"{type(e).__name__}: {e}"
             return False
 
-    def put_file(self, path: str, local_path, content_type: str = "application/octet-stream") -> bool:
+    def put_file(
+        self, path: str, local_path, content_type: str = "application/octet-stream",
+        progress_cb: Optional[Callable[[int], None]] = None,
+    ) -> bool:
+        """progress_cb(nbytes) — вызывается на каждый прочитанный кусок
+        файла ПО МЕРЕ того, как requests стримит его в тело PUT-запроса
+        (не после завершения всего запроса) — опционально, None (по
+        умолчанию) не меняет поведение ни для одного существующего
+        вызывающего кода."""
         self.last_error = ""
         try:
             with open(local_path, "rb") as f:
+                body = _ProgressReader(f, progress_cb) if progress_cb else f
                 r = self._retry(
-                    self.session.put, self._url(path), data=f,
+                    self.session.put, self._url(path), data=body,
                     headers={"Content-Type": content_type}, timeout=TIMEOUT_PUT,
                 )
             self.last_response = r

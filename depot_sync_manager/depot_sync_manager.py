@@ -24,7 +24,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 from datetime import datetime
 
 import requests
@@ -181,6 +181,29 @@ NC_PROPFIND_HEADERS = {
 
 
 # ── NextcloudDAV ──────────────────────────────────────────────────────────────
+
+class _ProgressReader:
+    """Та же обёртка, что panel_client.py::_ProgressReader (не общий
+    импорт — эти два транспорта намеренно независимы, см. их докстринги)
+    — put_file(progress_cb=...) сообщает о каждом прочитанном куске тела
+    PUT-запроса ПО МЕРЕ стриминга, а не только по факту завершения всего
+    запроса. Прямой запрос пользователя 2026-10-06 ("на этом этапе нет
+    ETA") — для одного большого pack-файла (HDD-режим, строго
+    последовательная заливка) раньше единственный прогресс приходил
+    после целого PUT, сколько бы тот ни длился."""
+    def __init__(self, fileobj, progress_cb: Callable[[int], None]):
+        self._f = fileobj
+        self._cb = progress_cb
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._f.read(size)
+        if chunk:
+            self._cb(len(chunk))
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
 
 class NextcloudDAV:
     """
@@ -398,14 +421,18 @@ class NextcloudDAV:
         path:         str,
         local_path:   Path,
         content_type: str = "application/octet-stream",
+        progress_cb:  Optional[Callable[[int], None]] = None,
     ) -> bool:
+        """progress_cb(nbytes) — см. _ProgressReader выше. None (по
+        умолчанию) — поведение не меняется для существующих вызывающих."""
         self.last_error = ""
         try:
             with open(local_path, "rb") as f:
+                body = _ProgressReader(f, progress_cb) if progress_cb else f
                 r = self._retry(
                     self.session.put,
                     self.url(path),
-                    data=f,
+                    data=body,
                     headers={"Content-Type": content_type},
                     timeout=TIMEOUT_PUT,
                 )
@@ -919,7 +946,23 @@ class DepotSyncManager(QObject):
                     chunk_source[cid][2] for cid in delta.chunks_to_upload
                     if cid in chunk_source
                 )
-                uploaded_bytes = 0
+                uploaded_bytes = 0   # ПОДТВЕРЖДЁННЫЕ (успешно завершённый PUT) байты
+                # Живой инцидент 2026-10-06: "нажимаю опубликовать и что-то
+                # куда-то грузится, но нет ETA на этом этапе" — ДО этой
+                # правки uploaded_bytes/_report_progress() обновлялись
+                # только ПОСЛЕ того, как целый PUT pack-файла завершался —
+                # для HDD-режима (один pack за раз, строго последовательно,
+                # до 96MB) это значило: пока идёт ОДИН PUT, прогресс-бар не
+                # двигался вообще, сколько бы этот PUT ни длился на
+                # медленном канале. inflight_bytes — байты, уже реально
+                # УШЕДШИЕ в сокет текущим(и) PUT-запросом(ами) (через
+                # put_file(progress_cb=...) — см. _ProgressReader выше),
+                # но ещё не подтверждённые сервером (PUT ещё не вернул
+                # успех) — отображаемый "текущий" прогресс ниже всегда
+                # uploaded_bytes + inflight_bytes, так что бар реально
+                # движется В ПРОЦЕССЕ одного большого PUT, не только
+                # между ними.
+                inflight_bytes = 0
                 state_lock = threading.Lock()
                 last_sample_t = time.time()
                 last_sample_uploaded = 0
@@ -931,36 +974,85 @@ class DepotSyncManager(QObject):
                 upload_pool = ThreadPoolExecutor(max_workers=max_upload_workers)
                 upload_sem = threading.Semaphore(max_upload_workers + 1)
 
-                def _report_progress():
+                def _report_progress(force: bool = False):
                     nonlocal last_sample_t, last_sample_uploaded, smoothed_speed
                     now = time.time()
                     sample_dt = now - last_sample_t
+                    # Троттлинг — не только пересчёт скорости, но и сам
+                    # emit(): progress_cb() вызывается на КАЖДЫЙ прочитанный
+                    # requests'ом кусок тела (десятки тысяч раз на 96MB-пак
+                    # при типичном блоке ~8KB) — без этого собственного
+                    # троттлинга тут вышел бы ровно тот класс проблемы
+                    # "поток строк сам топил GUI-поток", что уже чинился в
+                    # TESL (launcher) — см. её CLAUDE.md. force=True — в
+                    # момент, когда pack-файл реально ЗАВЕРШИЛСЯ (см.
+                    # _upload_one() ниже) — без него текст мог бы на
+                    # секунды разойтись с только что напечатанной строкой
+                    # "✅ pack-NNNNN.bin" в логе (сам процент не дойдёт до
+                    # нового значения, пока троттлинг не пропустит
+                    # очередной чанк СЛЕДУЮЩЕГО пака), что выглядело бы
+                    # как новая, уже другая путаница.
+                    if sample_dt < 0.5 and not force:
+                        return
+                    current = uploaded_bytes + inflight_bytes
+                    # Пересчитываем скользящую скорость, только если прошло
+                    # достаточно времени — force=True может сработать
+                    # гораздо раньше 0.5с с прошлого сэмпла (сразу после
+                    # throttled-коллбэка), а деление на маленький sample_dt
+                    # дало бы мнимый всплеск "скорости", портящий
+                    # сглаживание. В этом случае просто emit'им ТЕКУЩЕЕ
+                    # значение с уже известной (не пересчитанной) скоростью.
                     if sample_dt >= 0.5:
-                        inst = (uploaded_bytes - last_sample_uploaded) / sample_dt
+                        inst = (current - last_sample_uploaded) / sample_dt
                         alpha = 0.3
                         smoothed_speed = inst if smoothed_speed == 0 else (
                             alpha * inst + (1 - alpha) * smoothed_speed)
                         last_sample_t = now
-                        last_sample_uploaded = uploaded_bytes
-                    pct = int(uploaded_bytes / total_pack_bytes * 100) if total_pack_bytes else 100
-                    bytes_remaining = total_pack_bytes - uploaded_bytes
+                        last_sample_uploaded = current
+                    pct = int(current / total_pack_bytes * 100) if total_pack_bytes else 100
+                    bytes_remaining = total_pack_bytes - current
                     eta = _fmt_eta(bytes_remaining / smoothed_speed) if smoothed_speed > 0 else "?"
                     self.progress.emit(
-                        int(uploaded_bytes), int(total_pack_bytes),
+                        int(current), int(total_pack_bytes),
                         f"{pct}% — 📦⬆ {smoothed_speed / 1024 / 1024:.1f} MB/s — осталось: {eta}"
                     )
 
                 def _upload_one(pp: Path) -> None:
-                    nonlocal uploaded_bytes
+                    nonlocal uploaded_bytes, inflight_bytes
+                    # local_inflight — байты, которые ЭТА попытка этого
+                    # конкретного pack-файла уже насчитала в inflight_bytes
+                    # (общий, под state_lock) — список из одного элемента
+                    # вместо простой переменной, чтобы вложенные замыкания
+                    # (_attempt/_on_chunk) могли его читать/обнулять.
+                    # Нужен, чтобы ПОВТОРНАЯ попытка (ретрай целого PUT на
+                    # _retry_until_recovered(), не внутренний self._retry()
+                    # транспорта) не задвоила уже учтённые байты неудачной
+                    # попытки — put_file() на новой попытке открывает файл
+                    # заново с нуля, значит и наш счётчик для НЕЁ должен
+                    # начаться с нуля, откатив вклад предыдущей попытки.
+                    local_inflight = [0]
+
+                    def _on_chunk(nbytes: int) -> None:
+                        nonlocal inflight_bytes
+                        local_inflight[0] += nbytes
+                        with state_lock:
+                            inflight_bytes += nbytes
+                        _report_progress()
+
+                    def _attempt() -> bool:
+                        nonlocal inflight_bytes
+                        with state_lock:
+                            inflight_bytes -= local_inflight[0]
+                        local_inflight[0] = 0
+                        return dav.put_file(self._rp(PACKS_DIR, pp.name), pp, progress_cb=_on_chunk)
+
                     try:
                         if error_holder or stopped_holder:
                             return
-                        ok = self._retry_until_recovered(
-                            lambda: dav.put_file(self._rp(PACKS_DIR, pp.name), pp),
-                            dav, stop_fn, pp.name,
-                        )
+                        ok = self._retry_until_recovered(_attempt, dav, stop_fn, pp.name)
                         if not ok:
                             with state_lock:
+                                inflight_bytes -= local_inflight[0]
                                 if not error_holder:
                                     error_holder.append(
                                         f"Не удалось загрузить {pp.name}: {dav.last_error or 'см. лог'}"
@@ -972,11 +1064,19 @@ class DepotSyncManager(QObject):
                         except OSError:
                             pass
                         with state_lock:
+                            # Снимаем "в полёте" и фиксируем ТОЧНЫЙ размер
+                            # файла как подтверждённый — не сумму из
+                            # progress_cb (та может чуть разойтись с
+                            # реальным размером из-за заголовков/ретраев,
+                            # а pp.stat().st_size — источник истины и для
+                            # остального кода ниже, не менялся).
+                            inflight_bytes -= local_inflight[0]
                             uploaded_bytes += size
                         self.log.emit(f"  ✅ {pp.name} ({size // 1024} KB)")
-                        _report_progress()
+                        _report_progress(force=True)
                     except Exception as e:
                         with state_lock:
+                            inflight_bytes -= local_inflight[0]
                             if not error_holder:
                                 error_holder.append(f"Ошибка заливки {pp.name}: {e}")
                     finally:
