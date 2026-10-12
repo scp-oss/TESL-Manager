@@ -39,17 +39,18 @@ steps:
   # No credentials are embedded in the executable.
   - name: Build TESL-Manager.exe
     working-directory: depot_sync_manager
-    run: >
-      python -m PyInstaller
-      --noconfirm
-      --clean
-      --noconsole
-      --onefile
-      --windowed
-      --icon=icon.ico
-      --add-data "icon.ico;."
-      --name TESL-Manager
-      main.py
+    run: |
+      python -m PyInstaller `
+        --noconfirm `
+        --clean `
+        --noconsole `
+        --onefile `
+        --windowed `
+        --icon=icon.ico `
+        --add-data "icon.ico;." `
+        --name TESL-Manager `
+        main.py
+    shell: pwsh
 
   - name: Resolve and validate release tag
     id: tag
@@ -118,13 +119,11 @@ steps:
 
       if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
         echo "Release $TAG already exists; replacing executable."
-
         gh release upload "$TAG" "$EXE" \
           --repo "$REPO" \
           --clobber
       else
         echo "Creating release $TAG."
-
         gh release create "$TAG" "$EXE" \
           --repo "$REPO" \
           --title "TESL-Manager $TAG" \
